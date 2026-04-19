@@ -43,14 +43,19 @@ Purpose:
   - `PINCODE -> CITY -> STATE -> COUNTRY`
 - add nightly cron at `2:00 AM`
 - apply geo catalog to shops using `/geo/apply`
-- optionally enrich fallback generation with Gemini API
+- generate top products using a hybrid of:
+  - common nearby-shop products from DB
+  - Gemini AI suggested products
 
 In this phase:
 
 - cron runs every day at `2 AM`
 - all shop pincodes are processed
 - city/state/country catalogs are rebuilt after pincode generation
-- Gemini is used only for enrichment/fallback, not as primary source of truth
+- Gemini is not standalone source of truth
+- final top-product list is a merged list of:
+  - nearby real shop frequency products
+  - Gemini-suggested high-likelihood category products
 
 ---
 
@@ -201,9 +206,9 @@ module.exports = GeoCatalog;
 
 What this code does:
 
-- provides fallback product lists by category
-- provides a common place to add AI-backed enrichment later
-- in current version it is **mock-only**
+- provides Gemini-backed category product suggestions
+- provides a common place for AI-assisted product enrichment
+- in current version below it starts as **mock-only**, but Phase 2 should replace mock logic with real Gemini calls
 
 Phase 1 behavior:
 
@@ -213,10 +218,9 @@ Phase 1 behavior:
 Phase 2 behavior:
 
 - Gemini API can be added here
-- Gemini should be used only if:
-  - real source data is too sparse
-  - category needs enriched candidate product names
-  - normalization suggestions are needed
+- Gemini should generate candidate top products for each category
+- Gemini output should be merged with real nearby-shop products
+- Gemini should help improve coverage, not replace DB aggregation
 
 Suggested Phase 2 Gemini methods to add here:
 
@@ -230,7 +234,38 @@ Gemini should **not** replace:
 - `products`
 - `categories`
 
-Gemini should only assist fallback/enrichment.
+Correct Phase 2 logic:
+
+- DB gives **common real products sold nearby**
+- Gemini gives **likely missing but important products for that category**
+- final category top products should be a **mix of both**
+
+Recommended merge strategy:
+
+1. build frequency list from nearby real shops
+2. ask Gemini for category-wise likely top products
+3. normalize Gemini names
+4. remove duplicates already present in DB list
+5. assign Gemini a lower synthetic score than strong DB products
+6. merge and sort final list
+
+Example:
+
+For category `dairy`:
+
+- DB products:
+  - `amul gold milk`
+  - `nandini milk`
+  - `heritage curd`
+- Gemini products:
+  - `toned milk`
+  - `curd`
+  - `paneer`
+
+Final merged output:
+
+- real popular nearby products stay on top
+- Gemini products fill important missing gaps
 
 ```js
 const fallbackCatalog = {
@@ -515,6 +550,103 @@ module.exports = {
 };
 ```
 
+## Corrected Top Product Logic
+
+The previous fallback-only interpretation is not the right Phase 2 behavior.
+
+Correct logic should be:
+
+### Phase 1
+
+- build from nearby registered shop data
+- if data is too low, allow fallback mock products
+
+### Phase 2
+
+- build from nearby registered shop data
+- call Gemini for category suggestions
+- merge both sources into a final ranked top-product list
+
+Final top-product list must be:
+
+- **real nearby common products from DB**
+- plus **Gemini-generated likely products**
+
+Not:
+
+- DB only
+- Gemini only
+- Gemini only when DB is empty
+
+It should be a **hybrid ranking**.
+
+## Hybrid Ranking Model
+
+Recommended formula:
+
+### Source 1: Real nearby shop products
+
+For each normalized product:
+
+- count frequency across nearby shops
+- higher count = stronger rank
+
+Example:
+
+```js
+{
+  "amul gold milk": 120,
+  "nandini milk": 90,
+  "heritage curd": 40
+}
+```
+
+### Source 2: Gemini suggested products
+
+Gemini returns category-relevant products:
+
+```js
+[
+  "paneer",
+  "toned milk",
+  "fresh curd"
+]
+```
+
+After normalization and dedupe:
+
+- assign synthetic AI score
+- lower than strong DB products
+- but high enough to appear if category list is sparse
+
+Suggested AI scoring:
+
+```txt
+first Gemini product  = 25
+second Gemini product = 20
+third Gemini product  = 15
+others decreasing
+```
+
+### Final merge rule
+
+For each category:
+
+1. count DB products
+2. get Gemini category suggestions
+3. normalize Gemini names
+4. skip Gemini names already present in DB list
+5. add Gemini scores into same category map
+6. sort descending by score
+7. take top N
+
+This gives:
+
+- realistic local market signal
+- AI-assisted category completeness
+
+---
+
 ## `backend/catalogue_mgmt_service/src/apis/services/v1/pincodeCatalogBuilder.service.js`
 
 What this code does:
@@ -532,6 +664,11 @@ What this code does:
 This file is the core of:
 
 - `POST /geo/test/pincode`
+
+Phase 2 correction:
+
+- this file should not stop at DB aggregation only
+- it should merge DB top products with Gemini suggested products category-wise
 
 Detailed flow:
 
@@ -554,6 +691,21 @@ Detailed flow:
 10. if too little real data:
    - use fallback categories from `ai.service.js`
 
+Correct Phase 2 flow:
+
+1. shop lookup
+2. retailer product fetch
+3. normalize and group by category
+4. count DB product frequency
+5. for each category call Gemini suggestion method
+6. normalize Gemini names
+7. dedupe names already present from DB
+8. assign Gemini synthetic scores
+9. merge DB scores + Gemini scores
+10. sort descending
+11. take top N
+12. store final mixed list in Mongo
+
 Why fallback is needed:
 
 - some pincodes may have low real catalog coverage
@@ -563,6 +715,12 @@ Why fallback is needed:
 Important Phase 1 rule:
 
 - test only with `560100`
+
+Important Phase 2 rule:
+
+- final category products must be a hybrid list
+- DB signal should dominate top ranks if strong
+- Gemini should improve coverage, not override reality
 
 ```js
 const { Types } = require('mongoose');
@@ -577,6 +735,7 @@ const aiService = require('./ai.service');
 const shopGeoService = require('./shopGeo.service');
 
 const TOP_PRODUCTS_LIMIT = 10;
+const GEMINI_BASE_SCORE = 25;
 
 const getCategoryName = (retailerDoc, productDoc) => {
   const catalog = retailerDoc?.catalog || {};
@@ -667,6 +826,41 @@ const buildFallbackCategories = async () => {
   }));
 };
 
+const mergeGeminiProductsIntoCategories = async (categories = []) => {
+  const mergedCategories = [];
+
+  for (const category of categories) {
+    const dbProducts = category.products || [];
+    const dbNames = new Set(dbProducts.map((product) => product.name));
+
+    // Phase 2:
+    // Replace this mock call with real Gemini integration in ai.service.js
+    const geminiProducts = await aiService.getFallbackProducts([category.name]);
+    const suggestedProducts = geminiProducts[category.name] || geminiProducts[category.name?.replace(/\s+/g, '_')] || [];
+
+    const aiRankedProducts = suggestedProducts
+      .map((name) => normalizeProduct(name))
+      .filter(Boolean)
+      .filter((name) => !dbNames.has(name))
+      .slice(0, TOP_PRODUCTS_LIMIT)
+      .map((name, index) => ({
+        name,
+        count: Math.max(1, GEMINI_BASE_SCORE - index * 5),
+      }));
+
+    const finalProducts = [...dbProducts, ...aiRankedProducts]
+      .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+      .slice(0, TOP_PRODUCTS_LIMIT);
+
+    mergedCategories.push({
+      ...category,
+      products: finalProducts,
+    });
+  }
+
+  return mergedCategories;
+};
+
 const mapCountsToCategories = (categoryProductCounts) =>
   Object.entries(categoryProductCounts)
     .map(([name, products]) => ({
@@ -724,6 +918,7 @@ const buildPincodeCatalog = async (pincode) => {
     });
 
     categories = mapCountsToCategories(categoryProductCounts);
+    categories = await mergeGeminiProductsIntoCategories(categories);
 
     const uniqueProducts = categories.reduce((count, category) => count + category.products.length, 0);
     if (categories.length < 2 || uniqueProducts < 5) {
@@ -776,6 +971,32 @@ module.exports = {
   buildPincodeCatalog,
 };
 ```
+
+## What The Hybrid Merge Above Is Doing
+
+This added helper:
+
+```js
+mergeGeminiProductsIntoCategories(categories)
+```
+
+does the following:
+
+1. takes the DB-generated category product list
+2. gets Gemini-style category suggestions from `ai.service.js`
+3. normalizes those names
+4. removes duplicates already found from DB
+5. assigns AI scores
+6. merges both product sets
+7. returns final top products
+
+Meaning:
+
+- if nearby shops strongly sell `amul gold milk`, it stays high
+- if Gemini adds `paneer` and nearby DB is weak for paneer, paneer can still appear
+- result becomes both:
+  - locally relevant
+  - category complete
 
 ## `backend/catalogue_mgmt_service/src/apis/services/v1/geoHierarchy.service.js`
 
@@ -1735,9 +1956,9 @@ Optional dedicated file if you want cleaner separation:
 
 Allowed use cases:
 
-1. generate fallback products for categories with very low real data
+1. generate category-wise top-product suggestions
 2. suggest normalized product forms for noisy retailer names
-3. suggest additional candidate products for categories with insufficient top items
+3. suggest additional candidate products that are important but underrepresented in nearby DB data
 
 Not allowed as primary source:
 
@@ -1745,16 +1966,18 @@ Not allowed as primary source:
 - do not use Gemini instead of `products`
 - do not generate full catalogs blindly without real shop data
 
-### Suggested Gemini flow
+### Correct Suggested Gemini flow
 
-1. run normal aggregation from real data
-2. check if category is below threshold
-3. if below threshold:
-   - call Gemini with category context
-   - ask for 10 common retail products
-4. normalize Gemini output
-5. merge into fallback result
-6. save into `geo_catalogs`
+1. run normal aggregation from nearby real data
+2. build DB category-wise top-product map
+3. call Gemini for each category
+4. ask Gemini for likely top products for that category
+5. normalize Gemini output
+6. remove products already present from DB aggregation
+7. assign Gemini weighted score
+8. merge DB products and Gemini products
+9. sort descending
+10. save final merged list into `geo_catalogs`
 
 ### Suggested Gemini method shape
 
@@ -1762,6 +1985,21 @@ Not allowed as primary source:
 async function getGeminiFallbackProducts(categoryName, existingProducts = []) {
   // call Gemini
   // return array of product names
+}
+```
+
+Better function names for Phase 2:
+
+```js
+async function getGeminiTopProducts(categoryName, existingProducts = []) {
+  // return array of suggested product names for this category
+}
+
+function mergeDbAndGeminiProducts(dbProducts, geminiProducts) {
+  // normalize
+  // dedupe
+  // apply weighted AI score
+  // return sorted merged products
 }
 ```
 
@@ -1775,9 +2013,16 @@ Do not include explanation.
 
 ### When Gemini should run
 
-- during fallback generation only
-- not on every single product record
-- ideally once per weak category, not per item
+- once per category
+- after DB top products are already computed
+- before final sorting/storage
+- not on every product record
+
+So the sequence is:
+
+```txt
+DB nearby products -> category counts -> Gemini category suggestions -> merge -> final top products
+```
 
 ---
 
@@ -1831,6 +2076,9 @@ Expected response:
 - `categories` array exists
 - more than one category exists
 - each category has multiple products
+- final product list should represent:
+  - common nearby DB products
+  - plus AI suggested category products
 
 ### Step 3: Verify Mongo
 
@@ -1894,6 +2142,9 @@ What backend will do:
 1. fetch shop metadata
 2. resolve pincode from shop
 3. build geo catalog for that pincode
+4. merge:
+   - nearby DB common products
+   - Gemini category suggestions
 4. return top products
 
 Expected response:
@@ -1903,6 +2154,9 @@ Expected response:
 - `pincode` returned
 - `categories` returned
 - top products visible directly in Postman
+- each category may contain:
+  - real nearby high-frequency products
+  - AI-added complementary products
 
 This is a more practical validation flow than sending only raw pincode.
 
@@ -1979,6 +2233,12 @@ Expected:
 - else STATE
 - else COUNTRY
 
+Also verify:
+
+- categories are not purely DB only if AI merge is enabled
+- categories are not purely Gemini only unless DB is absent
+- final list is hybrid
+
 ---
 
 ## Cron Testing
@@ -2029,6 +2289,7 @@ Follow this exact order:
    - direct pincode test for `560100`
 3. Mongo `geo_catalogs` verification
    - confirm saved output
+   - confirm mixed DB + Gemini product list
 4. `GET /geo/catalog`
    - verify fetch and fallback path
 5. `POST /geo/apply`
@@ -2051,6 +2312,12 @@ Use this first when:
 - you want top products shown directly in Postman output
 
 This is the most practical manual validation endpoint.
+
+Use it to verify:
+
+- resolved pincode is correct
+- top products come from hybrid merge logic
+- categories look market-relevant
 
 ### Test `POST /geo/test/pincode`
 
@@ -2331,4 +2598,3 @@ POST http://localhost:2210/cms/apis/geo/apply
 GET  http://localhost:2210/cms/apis/geo/catalog?pincode=560100
 GET  http://localhost:2210/cms/apis/geo/catalog?shopId=1234
 ```
-
