@@ -1167,6 +1167,119 @@ module.exports = {
 };
 ```
 
+## Better API Testing Option: Test By `shopId`
+
+Yes, this is a better testing flow.
+
+Why:
+
+- in real usage you usually know the `shopId`
+- shop metadata can be used to resolve pincode automatically
+- Postman can show:
+  - resolved shop
+  - resolved pincode
+  - top products by category
+
+Recommended approach:
+
+1. send `shopId`
+2. backend fetches shop geo details
+3. backend extracts `pincode`
+4. backend builds geo catalog for that pincode
+5. response includes:
+   - `shopId`
+   - `pincode`
+   - `categories`
+
+Suggested new endpoint:
+
+- `POST /geo/test/shop`
+
+Suggested request body:
+
+```json
+{
+  "shopId": 1234
+}
+```
+
+Suggested response:
+
+```json
+{
+  "success": true,
+  "shopId": 1234,
+  "pincode": "560100",
+  "city": "Bengaluru",
+  "state": "Karnataka",
+  "categories": [
+    {
+      "name": "dairy",
+      "products": [
+        { "name": "amul gold milk", "count": 120 },
+        { "name": "nandini milk", "count": 90 }
+      ]
+    }
+  ]
+}
+```
+
+This is useful for Postman because you do not need to manually know the pincode first.
+
+## Add This In `backend/catalogue_mgmt_service/src/apis/controllers/v1/geo.js`
+
+What this code does:
+
+- accepts `shopId`
+- resolves shop location
+- gets pincode from shop metadata
+- calls existing `buildPincodeCatalog()`
+- returns top products
+
+Add:
+
+```js
+const testShopCatalog = async (req, res, next) => {
+  try {
+    const { shopId } = req.body;
+    const location = await shopGeoService.getShopLocation(Number(shopId));
+
+    if (!location?.pincode) {
+      return res.status(404).json({
+        success: false,
+        message: 'Pincode not found for the given shopId',
+      });
+    }
+
+    const result = await buildPincodeCatalog(location.pincode);
+
+    return res.status(200).json({
+      success: true,
+      shopId: Number(shopId),
+      pincode: location.pincode,
+      city: location.city || null,
+      state: location.state || null,
+      categories: result.categories,
+      usedFallback: result.usedFallback,
+    });
+  } catch (error) {
+    log.error({ error: 'Error while testShopCatalog', details: error.message });
+    next(error);
+  }
+};
+```
+
+And export it:
+
+```js
+module.exports = {
+  testPincodeCatalog,
+  testShopCatalog,
+  applyGeoCatalog,
+  getResolvedGeoCatalog,
+};
+```
+
 ## `backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js`
 
 What this code does:
@@ -1204,6 +1317,21 @@ router.get('/catalog', async (req, res, next) => {
 });
 
 module.exports = router;
+```
+
+## Add This In `backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js`
+
+What this route does:
+
+- allows Postman testing directly by `shopId`
+
+Add:
+
+```js
+router.post('/test/shop', async (req, res, next) => {
+  log.info({ info: 'Geo route :: test shop catalog' });
+  return GeoController.testShopCatalog(req, res, next);
+});
 ```
 
 ## `backend/catalogue_mgmt_service/src/jobs/geoCatalog.job.js`
@@ -1733,6 +1861,51 @@ Expected behavior:
 
 This is acceptable in Phase 1 because goal is to validate flow.
 
+### Alternate Phase 1 Test: By `shopId`
+
+This is the better manual test if you already have a valid shop.
+
+Method:
+
+- `POST`
+
+URL:
+
+```txt
+http://localhost:2210/cms/apis/geo/test/shop
+```
+
+Headers:
+
+```txt
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "shopId": 1234
+}
+```
+
+What backend will do:
+
+1. fetch shop metadata
+2. resolve pincode from shop
+3. build geo catalog for that pincode
+4. return top products
+
+Expected response:
+
+- `success = true`
+- `shopId` returned
+- `pincode` returned
+- `categories` returned
+- top products visible directly in Postman
+
+This is a more practical validation flow than sending only raw pincode.
+
 ---
 
 ## Phase 2 Postman Testing
@@ -1850,22 +2023,34 @@ db.geo_catalogs.find({ level: "COUNTRY" }).count()
 
 Follow this exact order:
 
-1. `POST /geo/test/pincode`
-   - verify Phase 1 aggregation works
-2. Mongo `geo_catalogs` verification
+1. `POST /geo/test/shop`
+   - best manual test if you know a valid `shopId`
+2. `POST /geo/test/pincode`
+   - direct pincode test for `560100`
+3. Mongo `geo_catalogs` verification
    - confirm saved output
-3. `GET /geo/catalog`
+4. `GET /geo/catalog`
    - verify fetch and fallback path
-4. `POST /geo/apply`
+5. `POST /geo/apply`
    - apply results to a shop
-5. Mongo `customcatalog` verification
+6. Mongo `customcatalog` verification
    - confirm `UNVERIFIED` rows inserted
-6. cron/manual job validation
+7. cron/manual job validation
    - confirm hierarchy creation
 
 ---
 
 ## When To Test Which API
+
+### Test `POST /geo/test/shop`
+
+Use this first when:
+
+- you know a valid `shopId`
+- you want backend to automatically resolve pincode
+- you want top products shown directly in Postman output
+
+This is the most practical manual validation endpoint.
 
 ### Test `POST /geo/test/pincode`
 
@@ -2135,6 +2320,7 @@ Content-Type: application/json
 Phase 1:
 
 ```txt
+POST http://localhost:2210/cms/apis/geo/test/shop
 POST http://localhost:2210/cms/apis/geo/test/pincode
 ```
 
@@ -2145,3 +2331,4 @@ POST http://localhost:2210/cms/apis/geo/apply
 GET  http://localhost:2210/cms/apis/geo/catalog?pincode=560100
 GET  http://localhost:2210/cms/apis/geo/catalog?shopId=1234
 ```
+
