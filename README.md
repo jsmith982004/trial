@@ -255,47 +255,47 @@ const { Logger: log } = require('sarvm-utility');
 const MongoProduct = require('../../models/mongoCatalog/productSchema');
 
 /**
- * Normalize string for matching
+ * Normalize string:
+ * - lowercase
+ * - remove spaces, commas, special characters
+ * - keep only a-z and 0-9
  */
 const normalize = (str = '') =>
-  String(str).trim().toLowerCase();
+  String(str)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '') // removes spaces, commas, symbols
+    .trim();
 
 /**
- * Match product names against MongoDB product collection
+ * Build catalogue map using MongoDB product collection
  *
  * @param {string[]} productNames
  * @returns {Promise<Map<string, { id: string, name: string }>>}
  */
 const matchAgainstCatalogue = async (productNames = []) => {
-  if (!productNames.length) return new Map();
-
   const matchedMap = new Map();
 
   try {
-    // Step 1: Normalize & dedupe input
-    const uniqueNames = [
-      ...new Set(productNames.map((n) => normalize(n)).filter(Boolean)),
-    ];
+    if (!productNames.length) return matchedMap;
 
-    // Step 2: Build regex queries (partial match)
-    const regexQueries = uniqueNames.map((name) => ({
-      prdNm: { $regex: name, $options: 'i' },
-    }));
+    // Step 1: Normalize input product names
+    const normalizedInputSet = new Set(
+      productNames.map((name) => normalize(name)).filter(Boolean)
+    );
 
-    // Step 3: Query MongoDB once
-    const results = await MongoProduct.find({
-      $or: regexQueries,
-    })
+    // Step 2: Fetch ALL products from Mongo (only required fields)
+    const products = await MongoProduct.find({})
       .select('_id prdNm')
       .lean()
       .exec();
 
-    // Step 4: Build map
-    results.forEach((product) => {
-      const key = normalize(product.prdNm);
+    // Step 3: Build lookup map (normalized name → product)
+    products.forEach((product) => {
+      const normalizedCatalogName = normalize(product.prdNm);
 
-      if (!matchedMap.has(key)) {
-        matchedMap.set(key, {
+      // Only store if it exists in input set (optimization)
+      if (normalizedInputSet.has(normalizedCatalogName)) {
+        matchedMap.set(normalizedCatalogName, {
           id: product._id,
           name: product.prdNm,
         });
@@ -303,13 +303,13 @@ const matchAgainstCatalogue = async (productNames = []) => {
     });
 
     log.info({
-      info: 'Mongo CatalogueMatcher complete',
-      inputCount: uniqueNames.length,
+      info: 'Catalogue matching complete (EXACT MATCH MODE)',
+      inputCount: normalizedInputSet.size,
       matchedCount: matchedMap.size,
     });
   } catch (error) {
     log.error({
-      error: 'Mongo CatalogueMatcher failed',
+      error: 'Catalogue matching failed',
       details: error.message,
     });
   }
@@ -318,31 +318,25 @@ const matchAgainstCatalogue = async (productNames = []) => {
 };
 
 /**
- * Filter products using matched catalogue map
+ * Filter products using exact match catalogue map
+ *
+ * @param {Array} products
+ * @param {Map} catalogueMap
+ * @returns {Array}
  */
 const filterByCatalogue = (products = [], catalogueMap) => {
   return products
     .map((product) => {
       const normalizedName = normalize(product.name);
 
-      // Find closest match (partial)
-      let matched = null;
-
-      for (const [key, value] of catalogueMap.entries()) {
-        if (
-          key.includes(normalizedName) ||
-          normalizedName.includes(key)
-        ) {
-          matched = value;
-          break;
-        }
-      }
+      // EXACT MATCH ONLY
+      const matched = catalogueMap.get(normalizedName);
 
       if (!matched) return null;
 
       return {
         ...product,
-        name: matched.name, // use Mongo product name
+        name: matched.name, // replace with exact catalog name
         catalogueProductId: matched.id,
       };
     })
