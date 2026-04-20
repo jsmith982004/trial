@@ -740,7 +740,7 @@ const { matchAgainstCatalogue, filterByCatalogue } = require('./catalogueMatcher
 const TOP_PRODUCTS_LIMIT = parseInt(process.env.TOP_PRODUCTS_LIMIT || '10', 10);
 const GEMINI_BASE_SCORE = 25;
 
-// ─── Helpers ─────────────────────────────────────────────────────────
+/* ---------------- HELPERS ---------------- */
 
 const getCategoryName = (retailerDoc, productDoc) => {
   const catalog = retailerDoc?.catalog || {};
@@ -751,7 +751,9 @@ const getCategoryName = (retailerDoc, productDoc) => {
     productDoc?.catPnm ||
     '';
 
-  const firstSegment = Array.isArray(rawCategory) ? rawCategory[0] : String(rawCategory).split('/')[0];
+  const firstSegment = Array.isArray(rawCategory)
+    ? rawCategory[0]
+    : String(rawCategory).split('/')[0];
 
   return String(firstSegment || '')
     .replace(/[_-]+/g, ' ')
@@ -759,77 +761,30 @@ const getCategoryName = (retailerDoc, productDoc) => {
     .toLowerCase();
 };
 
-const getCategorySeedList = async () => {
-  try {
-    const [productCategories, mongoCategories] = await Promise.all([
-      MongoProduct.aggregate([
-        { $project: { category: { $arrayElemAt: [{ $split: ['$catPnm', '/'] }, 0] } } },
-        { $match: { category: { $nin: [null, ''] } } },
-        { $group: { _id: '$category' } },
-        { $project: { _id: 0, name: { $toLower: '$_id' } } },
-      ]),
-      MongoCategory.aggregate([
-        { $project: { name: { $toLower: '$name' } } },
-        { $match: { name: { $nin: [null, ''] } } },
-        { $group: { _id: '$name' } },
-        { $project: { _id: 0, name: '$_id' } },
-      ]),
-    ]);
-
-    return [
-      ...new Set(
-        [...productCategories, ...mongoCategories]
-          .map((item) => item?.name)
-          .filter(Boolean)
-          .map((item) => item.replace(/[_-]+/g, ' ').trim().toLowerCase()),
-      ),
-    ];
-  } catch (error) {
-    log.warn({ warn: 'getCategorySeedList failed', error: error.message });
-    return [];
-  }
-};
-
-// ─── Fallback builder ────────────────────────────────────────────────
-
-const buildFallbackCategories = async () => {
-  const categorySeeds = await getCategorySeedList();
-  const fallback = aiService.getFallbackProducts(categorySeeds);
-
-  return Object.entries(fallback).map(([name, products]) => ({
-    name,
-    products: products.slice(0, TOP_PRODUCTS_LIMIT).map((productName, index) => ({
-      name: exactProductName(productName),
-      count: Math.max(1, TOP_PRODUCTS_LIMIT - index),
-      source: 'FALLBACK',
-    })),
-  }));
-};
-
-// ─── Gemini/AI merge into categories ─────────────────────────────────
+/* ---------------- AI MERGE ---------------- */
 
 const mergeAIProductsIntoCategories = async (categories = []) => {
   const mergedCategories = [];
 
   for (const category of categories) {
     const dbProducts = category.products || [];
-    const dbNames = new Set(dbProducts.map((p) => String(p.name).trim().toLowerCase()));
-    const existingNames = dbProducts.map((p) => p.name);
+    const dbNames = new Set(dbProducts.map((p) => p.name.toLowerCase()));
 
     let suggestedProducts = [];
     try {
-      // Phase 2: real Gemini call; Phase 1: falls back to static list
-      suggestedProducts = await aiService.getGeminiCategoryProducts(category.name, existingNames);
-    } catch (error) {
-      log.warn({ warn: `AI merge failed for category "${category.name}"`, error: error.message });
+      suggestedProducts = await aiService.getGeminiCategoryProducts(
+        category.name,
+        dbProducts.map((p) => p.name)
+      );
+    } catch {
       const fallback = aiService.getFallbackProducts([category.name]);
-      suggestedProducts = fallback[category.name] || fallback[category.name?.replace(/\s+/g, '_')] || [];
+      suggestedProducts = fallback[category.name] || [];
     }
 
-    const aiRankedProducts = suggestedProducts
-      .map((name) => exactProductName(name))
+    const aiProducts = suggestedProducts
+      .map(exactProductName)
       .filter(Boolean)
-      .filter((name) => !dbNames.has(String(name).trim().toLowerCase()))
+      .filter((n) => !dbNames.has(n.toLowerCase()))
       .slice(0, TOP_PRODUCTS_LIMIT)
       .map((name, index) => ({
         name,
@@ -837,151 +792,130 @@ const mergeAIProductsIntoCategories = async (categories = []) => {
         source: 'AI',
       }));
 
-    const finalProducts = [...dbProducts, ...aiRankedProducts]
-      .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
-      .slice(0, TOP_PRODUCTS_LIMIT * 2); // Keep more before catalogue filtering
-
     mergedCategories.push({
       ...category,
-      products: finalProducts,
+      products: [...dbProducts, ...aiProducts],
     });
   }
 
   return mergedCategories;
 };
 
-// ─── Catalogue matching step ─────────────────────────────────────────
+/* ---------------- MATCHING ---------------- */
 
 const applyCatalogueMatching = async (categories = []) => {
-  // Collect ALL product names across all categories
-  const allProductNames = [];
-  categories.forEach((cat) => {
-    (cat.products || []).forEach((p) => {
-      allProductNames.push(p.name);
-    });
-  });
+  const allNames = [];
+  categories.forEach((c) => c.products.forEach((p) => allNames.push(p.name)));
 
-  // Match all at once against master catalogue
-  const catalogueMap = await matchAgainstCatalogue(allProductNames);
+  const map = await matchAgainstCatalogue(allNames);
 
-  log.info({
-    info: 'Catalogue matching complete',
-    totalGenerated: allProductNames.length,
-    totalMatched: catalogueMap.size,
-  });
-
-  // Filter each category's products
-  return categories.map((category) => ({
-    ...category,
-    products: filterByCatalogue(category.products, catalogueMap).slice(0, TOP_PRODUCTS_LIMIT),
+  return categories.map((cat) => ({
+    ...cat,
+    products: filterByCatalogue(cat.products, map), // NO SLICE
   }));
 };
 
-// ─── Category count mapper ───────────────────────────────────────────
+/* ---------------- NEW MERGE LOGIC ---------------- */
 
-const mapCountsToCategories = (categoryProductCounts) =>
-  Object.entries(categoryProductCounts)
-    .map(([name, products]) => ({
-      name,
-      products: Object.entries(products)
-        .map(([productName, count]) => ({ name: productName, count, source: 'DB' }))
-        .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
-        .slice(0, TOP_PRODUCTS_LIMIT),
-    }))
-    .sort((left, right) => left.name.localeCompare(right.name));
+const mergeFinalCategories = (retailerCategories = [], topCategories = []) => {
+  const categoryMap = new Map();
 
-// ─── Main builder ────────────────────────────────────────────────────
+  retailerCategories.forEach((cat) => {
+    categoryMap.set(cat.name, { retailer: cat.products || [], top: [] });
+  });
+
+  topCategories.forEach((cat) => {
+    if (!categoryMap.has(cat.name)) {
+      categoryMap.set(cat.name, { retailer: [], top: cat.products || [] });
+    } else {
+      categoryMap.get(cat.name).top = cat.products || [];
+    }
+  });
+
+  const final = [];
+
+  categoryMap.forEach((value, name) => {
+    const rMap = new Map(value.retailer.map((p) => [p.catalogueProductId, p]));
+    const tMap = new Map(value.top.map((p) => [p.catalogueProductId, p]));
+
+    const common = [];
+    const retailerOnly = [];
+    const topOnly = [];
+
+    rMap.forEach((p, id) => {
+      if (tMap.has(id)) common.push(p);
+      else retailerOnly.push(p);
+    });
+
+    tMap.forEach((p, id) => {
+      if (!rMap.has(id)) topOnly.push(p);
+    });
+
+    const products = [...common, ...retailerOnly, ...topOnly].slice(
+      0,
+      TOP_PRODUCTS_LIMIT * 2
+    );
+
+    if (products.length) {
+      final.push({ name, products });
+    }
+  });
+
+  return final;
+};
+
+/* ---------------- MAIN BUILDER ---------------- */
 
 const buildPincodeCatalog = async (pincode) => {
   const normalizedPincode = String(pincode);
 
-  log.info({ info: `Building geo catalog for pincode: ${normalizedPincode}` });
-
-  let shops = [];
-  try {
-    shops = await shopGeoService.getShopsByPincode(normalizedPincode);
-  } catch (error) {
-    log.error({ error: `Shop lookup failed for pincode ${normalizedPincode}`, details: error.message });
-    shops = [];
-  }
-
-  const shopIds = shops.map((shop) => Number(shop.shopId)).filter(Boolean);
+  let shops = await shopGeoService.getShopsByPincode(normalizedPincode);
+  const shopIds = shops.map((s) => Number(s.shopId)).filter(Boolean);
 
   let categories = [];
-  let usedFallback = false;
   let buildStatus = 'SUCCESS';
 
   if (shopIds.length) {
-    try {
-      const retailerProducts = await RetailerCatalog.find({
-        shopId: { $in: shopIds },
-        catalog: { $ne: null },
+    const retailerProducts = await RetailerCatalog.find({
+      shopId: { $in: shopIds },
+      catalog: { $ne: null },
+    }).lean();
+
+    const categoryProductCounts = {};
+
+    retailerProducts.forEach((doc) => {
+      const name = exactProductName(doc?.catalog?.prdNm || '');
+      const category = getCategoryName(doc, null);
+
+      if (!name || !category) return;
+
+      categoryProductCounts[category] = categoryProductCounts[category] || {};
+      categoryProductCounts[category][name] =
+        (categoryProductCounts[category][name] || 0) + 1;
+    });
+
+    const retailerCategories = Object.entries(categoryProductCounts).map(
+      ([name, products]) => ({
+        name,
+        products: Object.entries(products).map(([n, c]) => ({
+          name: n,
+          count: c,
+          source: 'DB',
+        })),
       })
-        .lean()
-        .exec();
+    );
 
-      const productIds = retailerProducts
-        .map((item) => item?.catalog?._id)
-        .filter((id) => Types.ObjectId.isValid(id))
-        .map((id) => new Types.ObjectId(id));
+    let topCategories = await mergeAIProductsIntoCategories(
+      JSON.parse(JSON.stringify(retailerCategories))
+    );
 
-      const masterProducts = productIds.length
-        ? await MongoProduct.find({ _id: { $in: productIds } })
-            .select('_id catPnm prdNm')
-            .lean()
-            .exec()
-        : [];
+    const matchedRetailer = await applyCatalogueMatching(retailerCategories);
+    const matchedTop = await applyCatalogueMatching(topCategories);
 
-      const productMap = new Map(masterProducts.map((p) => [String(p._id), p]));
-      const categoryProductCounts = {};
-
-      retailerProducts.forEach((retailerDoc) => {
-        const masterProduct = productMap.get(String(retailerDoc?.catalog?._id));
-        const productName = exactProductName(retailerDoc?.catalog?.prdNm || masterProduct?.prdNm || '');
-        const categoryName = getCategoryName(retailerDoc, masterProduct);
-
-        if (!productName || !categoryName) return;
-
-        categoryProductCounts[categoryName] = categoryProductCounts[categoryName] || {};
-        categoryProductCounts[categoryName][productName] =
-          (categoryProductCounts[categoryName][productName] || 0) + 1;
-      });
-
-      categories = mapCountsToCategories(categoryProductCounts);
-
-      // Merge AI/Gemini suggestions
-      categories = await mergeAIProductsIntoCategories(categories);
-
-      // ★ CRITICAL: Match against master catalogue — only keep verified products
-      categories = await applyCatalogueMatching(categories);
-
-      const uniqueProducts = categories.reduce((count, cat) => count + cat.products.length, 0);
-      if (categories.length < 2 || uniqueProducts < 5) {
-        usedFallback = true;
-        buildStatus = 'PARTIAL';
-        const fallbackCategories = await buildFallbackCategories();
-        // Also catalogue-match fallback products
-        const matchedFallback = await applyCatalogueMatching(fallbackCategories);
-        categories = [...categories, ...matchedFallback];
-      }
-    } catch (error) {
-      log.error({ error: `Retailer aggregation failed for pincode ${normalizedPincode}`, details: error.message });
-      usedFallback = true;
-      buildStatus = 'FALLBACK';
-      categories = await buildFallbackCategories();
-      categories = await applyCatalogueMatching(categories);
-    }
-  } else {
-    usedFallback = true;
-    buildStatus = 'FALLBACK';
-    categories = await buildFallbackCategories();
-    categories = await applyCatalogueMatching(categories);
+    categories = mergeFinalCategories(matchedRetailer, matchedTop);
   }
 
-  // Remove empty categories (no catalogue matches)
-  categories = categories.filter((cat) => cat.products && cat.products.length > 0);
-
-  const primaryLocation = shops[0] || {};
+  categories = categories.filter((c) => c.products.length);
 
   const document = await GeoCatalog.findOneAndUpdate(
     { level: 'PINCODE', pincode: normalizedPincode },
@@ -989,39 +923,21 @@ const buildPincodeCatalog = async (pincode) => {
       $set: {
         level: 'PINCODE',
         pincode: normalizedPincode,
-        city: primaryLocation.city || null,
-        state: primaryLocation.state || null,
-        country: primaryLocation.country || 'India',
         categories,
         lastBuildAt: new Date(),
         buildStatus,
       },
     },
-    { new: true, upsert: true, setDefaultsOnInsert: true },
+    { upsert: true, new: true }
   );
-
-  log.info({
-    info: 'Geo pincode catalog built',
-    pincode: normalizedPincode,
-    categories: categories.length,
-    totalProducts: categories.reduce((c, cat) => c + cat.products.length, 0),
-    usedFallback,
-    buildStatus,
-  });
 
   return {
     success: true,
-    usedFallback,
-    buildStatus,
-    shopCount: shopIds.length,
     categories: document.categories,
-    document,
   };
 };
 
-module.exports = {
-  buildPincodeCatalog,
-};
+module.exports = { buildPincodeCatalog };
 ```
 
 ---
