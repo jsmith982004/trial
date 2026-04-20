@@ -1,8 +1,24 @@
-# Geo-Intelligent Auto Catalog System Full Code
+# Geo-Intelligent Auto Catalog System — Full Implementation
+
+## Core Design Principle
+
+> **Generated top products are kept internally, but the visible/output list is the catalogue-matched subset only.**
+
+This means:
+
+1. Build nearby-shop frequency products from real registered shops
+2. Generate category-wise candidates using Gemini AI (category-aware: fresh vs packaged)
+3. Keep that full generated result internally
+4. **Match generated items against the master catalogue (Postgres `product` table)**
+5. **Return only matched catalogue products to frontend**
+
+Because of this, **frontend does not need changes** — backend always returns valid catalogue products.
+
+---
 
 ## Rollout Plan
 
-This implementation should be executed in **2 phases**.
+This implementation is split into **2 phases**.
 
 ### Phase 1: Testing Only For Single Pincode `560100`
 
@@ -10,7 +26,8 @@ Purpose:
 
 - prove the aggregation logic works
 - validate category grouping
-- validate top-product generation
+- validate top-product generation from nearby shops
+- validate catalogue matching (only master-catalogue products in output)
 - validate Mongo insert into `geo_catalogs`
 - validate `POST /geo/test/pincode`
 
@@ -19,13 +36,14 @@ In this phase:
 - only run catalog build for `560100`
 - use `retailercatalog` as primary source
 - use fallback mock category data if real data is too low
-- do not depend on Gemini
+- **do not depend on Gemini** (use static fallback in `ai.service.js`)
+- **match all generated products against master catalogue before returning**
 
 Main entrypoint for this phase:
 
 - `buildPincodeCatalog('560100')`
 - API:
-  - `POST http://localhost:2210/cms/apis/geo/test/pincode`
+  - `POST http://localhost:2210/cms/apis/v1/geo/test/pincode`
 
 Expected result:
 
@@ -33,6 +51,8 @@ Expected result:
 - `pincode = 560100`
 - multiple categories
 - multiple products inside each category
+- **every returned product name exists in the master catalogue**
+- internal `_rawGeneratedProducts` kept for debugging but NOT sent to frontend
 
 ### Phase 2: Full Production-Style Implementation
 
@@ -41,21 +61,30 @@ Purpose:
 - expand from single pincode to all pincodes
 - add hierarchy fallback:
   - `PINCODE -> CITY -> STATE -> COUNTRY`
-- add nightly cron at `2:00 AM`
+- add nightly cron at `2:00 AM` (**one pincode at a time, sequential**)
 - apply geo catalog to shops using `/geo/apply`
 - generate top products using a hybrid of:
-  - common nearby-shop products from DB
-  - Gemini AI suggested products
+  - common nearby-shop products from DB (frequency counts)
+  - Gemini AI suggested products (**category-aware**)
+- **match ALL generated products against master catalogue before storing/returning**
+
+Category-aware Gemini generation:
+
+- **Fresh/local categories** (dairy, vegetables, fruits): common generic names like `tomato`, `bhindi`, `okra`, `paneer`
+- **Packaged categories** (snacks, beverages, personal care): brand/company-specific names like `Lays Classic Salted`, `Bikaji Bhujia`, `Colgate MaxFresh`
 
 In this phase:
 
 - cron runs every day at `2 AM`
+- **processes one pincode at a time** (sequential, not parallel) to avoid overloading Gemini API
 - all shop pincodes are processed
 - city/state/country catalogs are rebuilt after pincode generation
 - Gemini is not standalone source of truth
 - final top-product list is a merged list of:
   - nearby real shop frequency products
   - Gemini-suggested high-likelihood category products
+- **Before output, every product is matched against master catalogue**
+- **Only catalogue-matched products appear in API response and stored document**
 
 ---
 
@@ -63,68 +92,49 @@ In this phase:
 
 Test order should be:
 
-1. local DB connections
+1. local DB connections (Postgres + MongoDB)
 2. `POST /geo/test/pincode` for `560100`
-3. Mongo `geo_catalogs` insert
-4. `POST /geo/apply`
-5. Mongo `customcatalog` insert
-6. cron execution
-7. Gemini integration
+3. Verify Mongo `geo_catalogs` insert
+4. Verify returned products exist in master catalogue
+5. `POST /geo/test/shop` for a known shopId
+6. `POST /geo/apply`
+7. Mongo `customcatalog` insert verification
+8. Manual cron trigger via `POST /geo/cron/trigger`
+9. Nightly cron execution
+10. Gemini integration (Phase 2)
 
-## `backend/catalogue_mgmt_service/src/apis/utils/normalizeProduct.js`
+---
+
+## File-By-File Implementation
+
+### File 1: `backend/catalogue_mgmt_service/src/apis/utils/normalizeProduct.js`
+
+**Action: EDIT existing file (replace contents)**
 
 What this code does:
 
-- normalizes retailer product names before counting frequency
-- removes unit tokens like `500ml`, `1kg`, `200 g`
-- removes punctuation and numbers
-- makes product names comparable across shops
-
-Use case:
-
-- `"Amul Gold Milk 500ml"`
-- `"Amul Gold Milk - 500 ML"`
-- `"amul gold milk 0.5 l"`
-
-All become:
-
-- `"amul gold milk"`
+- keeps retailer product names exactly as stored in source data
+- removes only leading/trailing whitespace
+- does not change casing, units, punctuation, or numbers
 
 ```js
-const UNIT_PATTERN =
-  /\b\d+(?:\.\d+)?\s?(?:ml|l|ltr|litre|liter|g|gm|gram|grams|kg|kgs)\b|\b(?:ml|l|ltr|litre|liter|g|gm|gram|grams|kg|kgs)\b/gi;
+const exactProductName = (value = '') => String(value || '').trim();
 
-const normalizeProduct = (value = '') =>
-  String(value)
-    .toLowerCase()
-    .replace(/[^\w\s]/g, ' ')
-    .replace(UNIT_PATTERN, ' ')
-    .replace(/\b\d+(?:\.\d+)?\b/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-module.exports = normalizeProduct;
+module.exports = exactProductName;
 ```
 
-## `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/geoCatalogSchema.js`
+---
+
+### File 2: `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/geoCatalogSchema.js`
+
+**Action: EDIT existing file (replace contents)**
 
 What this code does:
 
-- creates the new Mongo collection `geo_catalogs`
+- Mongo collection `geo_catalogs`
 - stores multiple categories in one document
-- stores multiple products inside each category
-- supports hierarchy levels:
-  - `PINCODE`
-  - `CITY`
-  - `STATE`
-  - `COUNTRY`
-
-Why this structure:
-
-- one document per geo unit is easier to fetch
-- fallback lookup becomes simple
-- category-wise top products remain grouped
-- indexes support fast pincode lookup
+- stores both `matchedProducts` (catalogue-verified) and raw `products`
+- supports hierarchy levels: `PINCODE`, `CITY`, `STATE`, `COUNTRY`
 
 ```js
 const mongoose = require('mongoose');
@@ -140,6 +150,15 @@ const geoCatalogProductSchema = new mongoose.Schema(
       type: Number,
       default: 0,
       min: 0,
+    },
+    catalogueProductId: {
+      type: String,
+      default: null,
+    },
+    source: {
+      type: String,
+      enum: ['DB', 'AI', 'FALLBACK'],
+      default: 'DB',
     },
   },
   { _id: false },
@@ -188,6 +207,15 @@ const geoCatalogSchema = new mongoose.Schema(
       type: [geoCatalogCategorySchema],
       default: [],
     },
+    lastBuildAt: {
+      type: Date,
+      default: null,
+    },
+    buildStatus: {
+      type: String,
+      enum: ['SUCCESS', 'PARTIAL', 'FALLBACK', 'FAILED'],
+      default: 'SUCCESS',
+    },
   },
   { timestamps: true },
 );
@@ -202,147 +230,226 @@ const GeoCatalog = mongoose.model('geo_catalogs', geoCatalogSchema);
 module.exports = GeoCatalog;
 ```
 
-## `backend/catalogue_mgmt_service/src/apis/services/v1/ai.service.js`
+---
+
+### File 3: `backend/catalogue_mgmt_service/src/apis/services/v1/catalogueMatcher.service.js`
+
+**Action: CREATE new file**
 
 What this code does:
 
-- provides Gemini-backed category product suggestions
-- provides a common place for AI-assisted product enrichment
-- in current version below it starts as **mock-only**, but Phase 2 should replace mock logic with real Gemini calls
+- **This is the critical new piece** — matches generated product names against the master catalogue
+- Queries the Postgres `product` table via Objection.js model
+- Uses case-insensitive `ILIKE` matching
+- Returns only products that exist in the catalogue
+- Attaches the matched catalogue product ID to each result
 
-Phase 1 behavior:
+Why this exists:
 
-- no external API call
-- fallback products are static
-
-Phase 2 behavior:
-
-- Gemini API can be added here
-- Gemini should generate candidate top products for each category
-- Gemini output should be merged with real nearby-shop products
-- Gemini should help improve coverage, not replace DB aggregation
-
-Suggested Phase 2 Gemini methods to add here:
-
-- `getGeminiFallbackProducts(categoryName)`
-- `normalizeNamesWithGemini(names)`
-- `expandCategoryCandidates(categoryName, existingProducts)`
-
-Gemini should **not** replace:
-
-- `retailercatalog`
-- `products`
-- `categories`
-
-Correct Phase 2 logic:
-
-- DB gives **common real products sold nearby**
-- Gemini gives **likely missing but important products for that category**
-- final category top products should be a **mix of both**
-
-Recommended merge strategy:
-
-1. build frequency list from nearby real shops
-2. ask Gemini for category-wise likely top products
-3. normalize Gemini names
-4. remove duplicates already present in DB list
-5. assign Gemini a lower synthetic score than strong DB products
-6. merge and sort final list
-
-Example:
-
-For category `dairy`:
-
-- DB products:
-  - `amul gold milk`
-  - `nandini milk`
-  - `heritage curd`
-- Gemini products:
-  - `toned milk`
-  - `curd`
-  - `paneer`
-
-Final merged output:
-
-- real popular nearby products stay on top
-- Gemini products fill important missing gaps
+- Frontend should never show raw generated names directly
+- Only products existing in our catalogue should be returned
+- This is the filter between "generated internally" and "shown to user"
 
 ```js
+const { Logger: log } = require('sarvm-utility');
+const Product = require('../../models/product');
+
+/**
+ * Match an array of product names against the master catalogue (Postgres product table).
+ * Returns only products that have an exact or close match in the catalogue.
+ *
+ * @param {string[]} productNames - Array of product name strings to match
+ * @returns {Promise<Map<string, { id: string, name: string }>>} Map of lowercase name -> catalogue product
+ */
+const matchAgainstCatalogue = async (productNames = []) => {
+  if (!productNames.length) {
+    return new Map();
+  }
+
+  const matchedMap = new Map();
+
+  try {
+    // Dedupe and normalize for lookup
+    const uniqueNames = [...new Set(productNames.map((n) => String(n).trim()).filter(Boolean))];
+
+    // Batch query: find all products whose name matches any of the given names (case-insensitive)
+    // We use chunks to avoid overly large queries
+    const CHUNK_SIZE = 100;
+    const allMatched = [];
+
+    for (let i = 0; i < uniqueNames.length; i += CHUNK_SIZE) {
+      const chunk = uniqueNames.slice(i, i + CHUNK_SIZE);
+
+      try {
+        const results = await Product.query()
+          .select('id', 'name', 'dummyKey', 'image', 'status')
+          .where('status', '=', 'ACTIVE')
+          .where((builder) => {
+            chunk.forEach((productName) => {
+              builder.orWhere('name', 'ilike', productName);
+            });
+          });
+
+        allMatched.push(...results);
+      } catch (queryError) {
+        log.warn({
+          warn: 'CatalogueMatcher: chunk query failed',
+          error: queryError.message,
+          chunkSize: chunk.length,
+        });
+        // Continue with next chunk, don't fail entire operation
+      }
+    }
+
+    // Build lookup map: lowercase name -> catalogue product
+    allMatched.forEach((product) => {
+      const key = String(product.name).trim().toLowerCase();
+      if (!matchedMap.has(key)) {
+        matchedMap.set(key, {
+          id: product.id,
+          name: product.name,
+          dummyKey: product.dummyKey || null,
+          image: product.image || null,
+        });
+      }
+    });
+
+    log.info({
+      info: 'CatalogueMatcher: matching complete',
+      inputCount: uniqueNames.length,
+      matchedCount: matchedMap.size,
+    });
+  } catch (error) {
+    log.error({
+      error: 'CatalogueMatcher: matching failed',
+      details: error.message,
+    });
+    // Return empty map on failure — caller handles gracefully
+  }
+
+  return matchedMap;
+};
+
+/**
+ * Filter a category's products to only include those found in the catalogue.
+ *
+ * @param {Array<{name: string, count: number, source: string}>} products
+ * @param {Map<string, {id: string, name: string}>} catalogueMap
+ * @returns {Array<{name: string, count: number, source: string, catalogueProductId: string}>}
+ */
+const filterByCatalogue = (products = [], catalogueMap) => {
+  return products
+    .map((product) => {
+      const key = String(product.name).trim().toLowerCase();
+      const matched = catalogueMap.get(key);
+
+      if (!matched) {
+        return null; // Not in catalogue — exclude from output
+      }
+
+      return {
+        ...product,
+        name: matched.name, // Use the exact catalogue name (proper casing)
+        catalogueProductId: matched.id,
+      };
+    })
+    .filter(Boolean);
+};
+
+module.exports = {
+  matchAgainstCatalogue,
+  filterByCatalogue,
+};
+```
+
+---
+
+### File 4: `backend/catalogue_mgmt_service/src/apis/services/v1/ai.service.js`
+
+**Action: EDIT existing file (replace contents)**
+
+What this code does:
+
+- Phase 1: provides static fallback product lists (mock, no API call)
+- Phase 2: calls Gemini API for **category-aware** product suggestions
+  - Fresh/local categories → common/generic names (tomato, paneer, curd)
+  - Packaged categories → brand-specific names (Lays Classic Salted, Bisleri Water)
+- All generated names go through catalogue matching before being shown
+
+Phase 2 Gemini environment variables needed in `.lcl.env`:
+```
+GEMINI_API_KEY=your_key_here
+GEMINI_MODEL=gemini-2.0-flash
+```
+
+```js
+const { Logger: log } = require('sarvm-utility');
+
+// ─── PHASE 1: Static fallback catalog ────────────────────────────────
+
+const FRESH_CATEGORIES = new Set([
+  'dairy', 'vegetables', 'fruits', 'meat', 'fish', 'seafood',
+  'eggs', 'poultry', 'fresh produce', 'organic', 'farm fresh',
+]);
+
 const fallbackCatalog = {
   dairy: [
-    'milk',
-    'curd',
-    'butter',
-    'paneer',
-    'cheese',
-    'ghee',
-    'buttermilk',
-    'flavoured milk',
-    'cream',
-    'yogurt',
+    'Amul Gold Milk 500ml', 'Mother Dairy Curd 400g', 'Amul Butter 100g',
+    'Amul Paneer 200g', 'Amul Cheese Slice', 'Nandini Ghee 1L',
+    'Amul Buttermilk 200ml', 'Amul Kool Chocolate', 'Milky Mist Cream 200ml',
+    'Nestle Yogurt 100g',
   ],
   snacks: [
-    'chips',
-    'biscuits',
-    'namkeen',
-    'kurkure',
-    'mixture',
-    'cookies',
-    'nachos',
-    'popcorn',
-    'cracker',
-    'wafer',
+    'Lays Classic Salted 52g', 'Parle-G Biscuits 250g', 'Haldiram Namkeen 200g',
+    'Kurkure Masala Munch 90g', 'Bikaji Bhujia 200g', 'Britannia Good Day 250g',
+    'Too Yumm Veggie Stix', 'Act II Popcorn 70g', 'Parle Monaco 200g',
+    'Bingo Mad Angles 72g',
   ],
   beverages: [
-    'water',
-    'soft drinks',
-    'juice',
-    'tea',
-    'coffee',
-    'energy drink',
-    'soda',
-    'lassi',
-    'cold coffee',
-    'iced tea',
+    'Bisleri Water 1L', 'Coca Cola 750ml', 'Tropicana Orange Juice 1L',
+    'Tata Tea Gold 500g', 'Nescafe Classic 50g', 'Red Bull 250ml',
+    'Thums Up 750ml', 'Amul Lassi 200ml', 'Nescafe Cold Coffee 200ml',
+    'Lipton Iced Tea 350ml',
   ],
   staples: [
-    'rice',
-    'atta',
-    'toor dal',
-    'moong dal',
-    'salt',
-    'sugar',
-    'oil',
-    'poha',
-    'rava',
-    'suji',
+    'India Gate Basmati Rice 5kg', 'Aashirvaad Atta 10kg', 'Tata Toor Dal 1kg',
+    'Tata Moong Dal 1kg', 'Tata Salt 1kg', 'Madhur Sugar 1kg',
+    'Fortune Sunflower Oil 1L', 'Maggi Poha 500g', 'Sooji Rava 500g',
+    'MTR Rava Idli Mix 500g',
+  ],
+  vegetables: [
+    'Tomato', 'Onion', 'Potato', 'Bhindi (Okra)', 'Brinjal',
+    'Capsicum', 'Carrot', 'Cauliflower', 'Cabbage', 'Green Chilli',
+  ],
+  fruits: [
+    'Banana', 'Apple', 'Mango', 'Grapes', 'Papaya',
+    'Watermelon', 'Pomegranate', 'Orange', 'Guava', 'Sapota (Chiku)',
   ],
   bakery: [
-    'bread',
-    'bun',
-    'rusk',
-    'cake',
-    'muffin',
-    'pav',
-    'khari',
-    'toast',
-    'brown bread',
-    'cookies',
+    'Britannia Bread White', 'Amul Butter Bun', 'Britannia Rusk 300g',
+    'Monginis Cake Slice', 'Britannia Muffin Chocolate', 'Pav 6 Pack',
+    'Parle Khari 200g', 'Britannia Toast', 'Harvest Gold Brown Bread',
+    'Britannia Good Day Cookies 250g',
   ],
   personal_care: [
-    'soap',
-    'shampoo',
-    'toothpaste',
-    'face wash',
-    'body wash',
-    'deo',
-    'talc',
-    'moisturizer',
-    'toothbrush',
-    'hair oil',
+    'Dove Soap 100g', 'Head & Shoulders Shampoo 180ml', 'Colgate MaxFresh 150g',
+    'Garnier Face Wash 100ml', 'Dettol Body Wash 250ml', 'Nivea Deo 150ml',
+    'Ponds Talc 300g', 'Vaseline Lotion 200ml', 'Oral-B Toothbrush',
+    'Parachute Hair Oil 200ml',
   ],
 };
 
+/**
+ * Determine if a category should use fresh/local product names or brand/packaged names.
+ */
+const isFreshCategory = (categoryName) => {
+  const normalized = String(categoryName || '').trim().toLowerCase().replace(/\s+/g, ' ');
+  return FRESH_CATEGORIES.has(normalized);
+};
+
+/**
+ * Phase 1: Get static fallback products for given categories.
+ */
 const getFallbackProducts = (categories = []) => {
   const resolved = {};
 
@@ -364,35 +471,109 @@ const getFallbackProducts = (categories = []) => {
   return resolved;
 };
 
+// ─── PHASE 2: Gemini API Integration ─────────────────────────────────
+
+let geminiAvailable = false;
+let GoogleGenerativeAI = null;
+
+// Try to load Gemini SDK (install @google/generative-ai for Phase 2)
+try {
+  const geminiModule = require('@google/generative-ai');
+  GoogleGenerativeAI = geminiModule.GoogleGenerativeAI;
+  geminiAvailable = true;
+} catch (e) {
+  // Gemini SDK not installed — Phase 1 mode, use fallback only
+  geminiAvailable = false;
+}
+
+/**
+ * Phase 2: Call Gemini to get category-aware product suggestions.
+ *
+ * For FRESH categories: returns common generic product names (e.g., "Tomato", "Paneer")
+ * For PACKAGED categories: returns brand-specific names (e.g., "Lays Classic Salted 52g")
+ *
+ * @param {string} categoryName
+ * @param {string[]} existingProducts - products already found from DB, to avoid duplicates
+ * @returns {Promise<string[]>} Array of suggested product names
+ */
+const getGeminiCategoryProducts = async (categoryName, existingProducts = []) => {
+  if (!geminiAvailable || !process.env.GEMINI_API_KEY) {
+    log.info({ info: `AI Service: Gemini not available for category "${categoryName}", using fallback` });
+    const fallback = getFallbackProducts([categoryName]);
+    return fallback[categoryName] || fallback[categoryName?.replace(/\s+/g, '_')] || [];
+  }
+
+  try {
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' });
+
+    const isFresh = isFreshCategory(categoryName);
+    const existingList = existingProducts.slice(0, 20).join(', ');
+
+    let prompt;
+    if (isFresh) {
+      prompt = `You are a product catalog expert for Indian retail stores.
+For the category "${categoryName}", give me 15 common product names that Indian grocery stores typically sell.
+Since this is a fresh/local/unpackaged category, use common generic names (e.g., "Tomato", "Onion", "Paneer", "Curd").
+Do NOT use brand names for this category.
+${existingList ? `These products are already found: ${existingList}. Suggest DIFFERENT products not in this list.` : ''}
+Return ONLY a valid JSON array of short product name strings. No explanations.`;
+    } else {
+      prompt = `You are a product catalog expert for Indian retail stores.
+For the category "${categoryName}", give me 15 commonly sold products in Indian retail/grocery stores.
+Since this is a packaged/branded category, use specific brand names and pack sizes where relevant (e.g., "Lays Classic Salted 52g", "Parle-G 250g", "Colgate MaxFresh 150g").
+${existingList ? `These products are already found: ${existingList}. Suggest DIFFERENT products not in this list.` : ''}
+Return ONLY a valid JSON array of short product name strings. No explanations.`;
+    }
+
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+
+    // Extract JSON array from response
+    const jsonMatch = responseText.match(/\[[\s\S]*?\]/);
+    if (!jsonMatch) {
+      log.warn({ warn: `AI Service: Gemini returned non-JSON for category "${categoryName}"` });
+      return getFallbackProducts([categoryName])[categoryName] || [];
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!Array.isArray(parsed)) {
+      return getFallbackProducts([categoryName])[categoryName] || [];
+    }
+
+    log.info({
+      info: `AI Service: Gemini returned ${parsed.length} products for "${categoryName}" (${isFresh ? 'fresh' : 'packaged'})`,
+    });
+
+    return parsed.map((name) => String(name).trim()).filter(Boolean);
+  } catch (error) {
+    log.error({
+      error: `AI Service: Gemini call failed for category "${categoryName}"`,
+      details: error.message,
+    });
+    // Fallback on any error
+    return getFallbackProducts([categoryName])[categoryName] || [];
+  }
+};
+
 module.exports = {
   normalizeNames: (names = [], normalizer) => names.map((name) => normalizer(name)).filter(Boolean),
   getFallbackProducts,
+  getGeminiCategoryProducts,
+  isFreshCategory,
 };
 ```
 
-## `backend/catalogue_mgmt_service/src/apis/services/v1/shopGeo.service.js`
+---
+
+### File 5: `backend/catalogue_mgmt_service/src/apis/services/v1/shopGeo.service.js`
+
+**Action: CREATE new file**
 
 What this code does:
 
-- resolves shop location metadata required for pincode grouping
-- fetches real shop geo details from RMS APIs
-- falls back to local Mongo collections if remote APIs are unavailable
-
-Why this exists:
-
-- `retailercatalog` itself does not store pincode/city/state/country
-- pincode must be resolved from shop metadata
-
-Main functions:
-
-- `getShopLocations(shopIds)`
-  - resolve shop -> pincode/city/state/country
-- `getAllShopLocations()`
-  - used by cron for all shops
-- `getShopsByPincode(pincode)`
-  - used by Phase 1 test flow
-- `getShopLocation(shopId)`
-  - used by `/geo/apply`
+- resolves shop location metadata (pincode/city/state/country) for grouping
+- fetches from RMS APIs, falls back to local Mongo collections
 
 ```js
 const axios = require('axios');
@@ -404,20 +585,15 @@ const { loadBalancer, system_token } = require('@config');
 
 const chunkArray = (items = [], size = 100) => {
   const chunks = [];
-
   for (let index = 0; index < items.length; index += size) {
     chunks.push(items.slice(index, index + size));
   }
-
   return chunks;
 };
 
 const normalizeRecord = (record = {}) => {
   const shopId = Number(record.shopId || record.shop_id || record.id);
-
-  if (!shopId) {
-    return null;
-  }
+  if (!shopId) return null;
 
   return {
     shopId,
@@ -432,60 +608,45 @@ const normalizeRecord = (record = {}) => {
 };
 
 const fetchFromRemote = async (shopIds = []) => {
-  if (!shopIds.length || !loadBalancer) {
-    return [];
-  }
+  if (!shopIds.length || !loadBalancer) return [];
 
   try {
     const response = await axios({
       method: 'get',
       url: `${loadBalancer}/rms/apis/v2/shop/getPGShopDetails/${shopIds.join(',')}`,
       timeout: 4000,
-      headers: {
-        Authorization: `Bearer ${system_token}`,
-      },
+      headers: { Authorization: `Bearer ${system_token}` },
     });
-
     return (response?.data?.data || []).map(normalizeRecord).filter(Boolean);
   } catch (error) {
-    log.warn({ warn: 'Geo shop remote lookup failed, error: error.message' });
+    log.warn({ warn: 'Geo shop remote lookup failed', error: error.message });
     return [];
   }
 };
 
 const fetchFromLocalCollections = async (shopIds = []) => {
-  if (!shopIds.length || !mongoose.connection?.db) {
-    return [];
-  }
+  if (!shopIds.length || !mongoose.connection?.db) return [];
 
   const candidateCollections = ['shops', 'shopdetails', 'shopdetail', 'shop_meta', 'shopmeta', 'shopmetadata'];
 
   try {
     const existingCollections = await mongoose.connection.db.listCollections().toArray();
-    const collectionNames = new Set(existingCollections.map((collection) => collection.name));
+    const collectionNames = new Set(existingCollections.map((c) => c.name));
     const records = [];
 
     for (const collectionName of candidateCollections) {
-      if (!collectionNames.has(collectionName)) {
-        continue;
-      }
+      if (!collectionNames.has(collectionName)) continue;
 
       const collection = mongoose.connection.db.collection(collectionName);
       const docs = await collection
-        .find({
-          $or: [{ shopId: { $in: shopIds } }, { shop_id: { $in: shopIds } }],
-        })
+        .find({ $or: [{ shopId: { $in: shopIds } }, { shop_id: { $in: shopIds } }] })
         .toArray();
 
       docs.forEach((doc) => {
         const normalized = normalizeRecord(doc);
-
-        if (normalized) {
-          records.push(normalized);
-        }
+        if (normalized) records.push(normalized);
       });
     }
-
     return records;
   } catch (error) {
     log.warn({ warn: 'Geo shop local collection lookup failed', error: error.message });
@@ -495,29 +656,23 @@ const fetchFromLocalCollections = async (shopIds = []) => {
 
 const dedupeByShopId = (records = []) => {
   const map = new Map();
-
   records.forEach((record) => {
-    if (!record?.shopId || map.has(record.shopId)) {
-      return;
-    }
-
+    if (!record?.shopId || map.has(record.shopId)) return;
     map.set(record.shopId, record);
   });
-
   return Array.from(map.values());
 };
 
 const getShopLocations = async (shopIds = []) => {
-  const normalizedIds = [...new Set(shopIds.map((shopId) => Number(shopId)).filter(Boolean))];
+  const normalizedIds = [...new Set(shopIds.map((id) => Number(id)).filter(Boolean))];
   const allRecords = [];
 
   for (const chunk of chunkArray(normalizedIds)) {
     const remoteRecords = await fetchFromRemote(chunk);
     const missingIds = chunk.filter(
-      (shopId) => !remoteRecords.some((record) => Number(record.shopId) === Number(shopId)),
+      (id) => !remoteRecords.some((r) => Number(r.shopId) === Number(id)),
     );
     const localRecords = missingIds.length ? await fetchFromLocalCollections(missingIds) : [];
-
     allRecords.push(...remoteRecords, ...localRecords);
   }
 
@@ -526,14 +681,14 @@ const getShopLocations = async (shopIds = []) => {
 
 const getAllRetailerShopIds = async () => {
   const shopIds = await RetailerCatalog.distinct('shopId', { shopId: { $ne: null } });
-  return shopIds.map((shopId) => Number(shopId)).filter(Boolean);
+  return shopIds.map((id) => Number(id)).filter(Boolean);
 };
 
 const getAllShopLocations = async () => getShopLocations(await getAllRetailerShopIds());
 
 const getShopsByPincode = async (pincode) => {
   const records = await getAllShopLocations();
-  return records.filter((record) => String(record.pincode) === String(pincode));
+  return records.filter((r) => String(r.pincode) === String(pincode));
 };
 
 const getShopLocation = async (shopId) => {
@@ -550,177 +705,31 @@ module.exports = {
 };
 ```
 
-## Corrected Top Product Logic
-
-The previous fallback-only interpretation is not the right Phase 2 behavior.
-
-Correct logic should be:
-
-### Phase 1
-
-- build from nearby registered shop data
-- if data is too low, allow fallback mock products
-
-### Phase 2
-
-- build from nearby registered shop data
-- call Gemini for category suggestions
-- merge both sources into a final ranked top-product list
-
-Final top-product list must be:
-
-- **real nearby common products from DB**
-- plus **Gemini-generated likely products**
-
-Not:
-
-- DB only
-- Gemini only
-- Gemini only when DB is empty
-
-It should be a **hybrid ranking**.
-
-## Hybrid Ranking Model
-
-Recommended formula:
-
-### Source 1: Real nearby shop products
-
-For each normalized product:
-
-- count frequency across nearby shops
-- higher count = stronger rank
-
-Example:
-
-```js
-{
-  "amul gold milk": 120,
-  "nandini milk": 90,
-  "heritage curd": 40
-}
-```
-
-### Source 2: Gemini suggested products
-
-Gemini returns category-relevant products:
-
-```js
-[
-  "paneer",
-  "toned milk",
-  "fresh curd"
-]
-```
-
-After normalization and dedupe:
-
-- assign synthetic AI score
-- lower than strong DB products
-- but high enough to appear if category list is sparse
-
-Suggested AI scoring:
-
-```txt
-first Gemini product  = 25
-second Gemini product = 20
-third Gemini product  = 15
-others decreasing
-```
-
-### Final merge rule
-
-For each category:
-
-1. count DB products
-2. get Gemini category suggestions
-3. normalize Gemini names
-4. skip Gemini names already present in DB list
-5. add Gemini scores into same category map
-6. sort descending by score
-7. take top N
-
-This gives:
-
-- realistic local market signal
-- AI-assisted category completeness
-
 ---
 
-## `backend/catalogue_mgmt_service/src/apis/services/v1/pincodeCatalogBuilder.service.js`
+### File 6: `backend/catalogue_mgmt_service/src/apis/services/v1/pincodeCatalogBuilder.service.js`
+
+**Action: CREATE new file**
 
 What this code does:
 
-- this is the main Phase 1 builder
-- takes one pincode, for example `560100`
-- finds all shops in that pincode
-- finds all retailer catalog rows for those shops
-- extracts product name and category
-- normalizes names
-- counts frequency
-- returns top products category-wise
-- stores the result in `geo_catalogs`
+- **This is the core builder** for Phase 1 and Phase 2
+- Takes a pincode → finds shops → finds retailer products → groups by category → counts frequency
+- Merges Gemini/fallback suggestions
+- **Matches ALL products against master catalogue before storing/returning**
+- Only catalogue-matched products appear in the final output
 
-This file is the core of:
+Key flow:
 
-- `POST /geo/test/pincode`
-
-Phase 2 correction:
-
-- this file should not stop at DB aggregation only
-- it should merge DB top products with Gemini suggested products category-wise
-
-Detailed flow:
-
-1. shop lookup:
-   - `shopGeoService.getShopsByPincode(pincode)`
-2. retailer product fetch:
-   - `RetailerCatalog.find({ shopId: { $in: shopIds } })`
-3. name extraction:
-   - `retailercatalog.catalog.prdNm`
-4. category extraction:
-   - `retailercatalog.category`
-   - else first segment of `catalog.catPnm`
-5. normalization:
-   - `normalizeProduct()`
-6. category grouping:
-   - `{ dairy: { amul gold milk: 10 } }`
-7. sort by descending count
-8. take top N
-9. store in Mongo
-10. if too little real data:
-   - use fallback categories from `ai.service.js`
-
-Correct Phase 2 flow:
-
-1. shop lookup
-2. retailer product fetch
-3. normalize and group by category
-4. count DB product frequency
-5. for each category call Gemini suggestion method
-6. normalize Gemini names
-7. dedupe names already present from DB
-8. assign Gemini synthetic scores
-9. merge DB scores + Gemini scores
-10. sort descending
-11. take top N
-12. store final mixed list in Mongo
-
-Why fallback is needed:
-
-- some pincodes may have low real catalog coverage
-- Phase 1 still requires multiple categories and multiple products per category
-- fallback helps validate the full flow end-to-end
-
-Important Phase 1 rule:
-
-- test only with `560100`
-
-Important Phase 2 rule:
-
-- final category products must be a hybrid list
-- DB signal should dominate top ranks if strong
-- Gemini should improve coverage, not override reality
+1. Shop lookup by pincode
+2. Retailer product fetch from MongoDB
+3. Extract product names and categories, count frequency
+4. For each category: get Gemini/fallback suggestions
+5. Merge DB products + AI products
+6. **Match entire merged list against master catalogue (Postgres)**
+7. **Keep only matched products**
+8. Store result in `geo_catalogs`
+9. Return catalogue-matched products
 
 ```js
 const { Types } = require('mongoose');
@@ -728,14 +737,17 @@ const { Logger: log } = require('sarvm-utility');
 
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
 const GeoCatalog = require('../../models/mongoCatalog/geoCatalogSchema');
-const Product = require('../../models/mongoCatalog/productSchema');
-const Category = require('../../models/mongoCatalog/categorySchema');
-const normalizeProduct = require('../../utils/normalizeProduct');
+const MongoProduct = require('../../models/mongoCatalog/productSchema');
+const MongoCategory = require('../../models/mongoCatalog/categorySchema');
+const exactProductName = require('../../utils/normalizeProduct');
 const aiService = require('./ai.service');
 const shopGeoService = require('./shopGeo.service');
+const { matchAgainstCatalogue, filterByCatalogue } = require('./catalogueMatcher.service');
 
-const TOP_PRODUCTS_LIMIT = 10;
+const TOP_PRODUCTS_LIMIT = parseInt(process.env.TOP_PRODUCTS_LIMIT || '10', 10);
 const GEMINI_BASE_SCORE = 25;
+
+// ─── Helpers ─────────────────────────────────────────────────────────
 
 const getCategoryName = (retailerDoc, productDoc) => {
   const catalog = retailerDoc?.catalog || {};
@@ -746,72 +758,46 @@ const getCategoryName = (retailerDoc, productDoc) => {
     productDoc?.catPnm ||
     '';
 
-  return String(rawCategory)
-    .split('/')[0]
+  const firstSegment = Array.isArray(rawCategory) ? rawCategory[0] : String(rawCategory).split('/')[0];
+
+  return String(firstSegment || '')
     .replace(/[_-]+/g, ' ')
     .trim()
     .toLowerCase();
 };
 
 const getCategorySeedList = async () => {
-  const [productCategories, mongoCategories] = await Promise.all([
-    Product.aggregate([
-      {
-        $project: {
-          category: { $arrayElemAt: [{ $split: ['$catPnm', '/'] }, 0] },
-        },
-      },
-      {
-        $match: {
-          category: { $nin: [null, ''] },
-        },
-      },
-      {
-        $group: {
-          _id: '$category',
-        },
-      },
-      {
-        $project: {
-          _id: 0,
-          name: { $toLower: '$_id' },
-        },
-      },
-    ]),
-    Category.aggregate([
-      {
-        $project: {
-          name: { $toLower: '$name' },
-        },
-      },
-      {
-        $match: {
-          name: { $nin: [null, ''] },
-        },
-      },
-      {
-        $group: {
-          _id: '$name',
-        },
-      },
-      {
-        $project: {
-          _id: 0,
-          name: '$_id',
-        },
-      },
-    ]),
-  ]);
+  try {
+    const [productCategories, mongoCategories] = await Promise.all([
+      MongoProduct.aggregate([
+        { $project: { category: { $arrayElemAt: [{ $split: ['$catPnm', '/'] }, 0] } } },
+        { $match: { category: { $nin: [null, ''] } } },
+        { $group: { _id: '$category' } },
+        { $project: { _id: 0, name: { $toLower: '$_id' } } },
+      ]),
+      MongoCategory.aggregate([
+        { $project: { name: { $toLower: '$name' } } },
+        { $match: { name: { $nin: [null, ''] } } },
+        { $group: { _id: '$name' } },
+        { $project: { _id: 0, name: '$_id' } },
+      ]),
+    ]);
 
-  return [
-    ...new Set(
-      [...productCategories, ...mongoCategories]
-        .map((item) => item?.name)
-        .filter(Boolean)
-        .map((item) => item.replace(/[_-]+/g, ' ').trim().toLowerCase()),
-    ),
-  ];
+    return [
+      ...new Set(
+        [...productCategories, ...mongoCategories]
+          .map((item) => item?.name)
+          .filter(Boolean)
+          .map((item) => item.replace(/[_-]+/g, ' ').trim().toLowerCase()),
+      ),
+    ];
+  } catch (error) {
+    log.warn({ warn: 'getCategorySeedList failed', error: error.message });
+    return [];
+  }
 };
+
+// ─── Fallback builder ────────────────────────────────────────────────
 
 const buildFallbackCategories = async () => {
   const categorySeeds = await getCategorySeedList();
@@ -820,37 +806,47 @@ const buildFallbackCategories = async () => {
   return Object.entries(fallback).map(([name, products]) => ({
     name,
     products: products.slice(0, TOP_PRODUCTS_LIMIT).map((productName, index) => ({
-      name: normalizeProduct(productName),
+      name: exactProductName(productName),
       count: Math.max(1, TOP_PRODUCTS_LIMIT - index),
+      source: 'FALLBACK',
     })),
   }));
 };
 
-const mergeGeminiProductsIntoCategories = async (categories = []) => {
+// ─── Gemini/AI merge into categories ─────────────────────────────────
+
+const mergeAIProductsIntoCategories = async (categories = []) => {
   const mergedCategories = [];
 
   for (const category of categories) {
     const dbProducts = category.products || [];
-    const dbNames = new Set(dbProducts.map((product) => product.name));
+    const dbNames = new Set(dbProducts.map((p) => String(p.name).trim().toLowerCase()));
+    const existingNames = dbProducts.map((p) => p.name);
 
-    // Phase 2:
-    // Replace this mock call with real Gemini integration in ai.service.js
-    const geminiProducts = await aiService.getFallbackProducts([category.name]);
-    const suggestedProducts = geminiProducts[category.name] || geminiProducts[category.name?.replace(/\s+/g, '_')] || [];
+    let suggestedProducts = [];
+    try {
+      // Phase 2: real Gemini call; Phase 1: falls back to static list
+      suggestedProducts = await aiService.getGeminiCategoryProducts(category.name, existingNames);
+    } catch (error) {
+      log.warn({ warn: `AI merge failed for category "${category.name}"`, error: error.message });
+      const fallback = aiService.getFallbackProducts([category.name]);
+      suggestedProducts = fallback[category.name] || fallback[category.name?.replace(/\s+/g, '_')] || [];
+    }
 
     const aiRankedProducts = suggestedProducts
-      .map((name) => normalizeProduct(name))
+      .map((name) => exactProductName(name))
       .filter(Boolean)
-      .filter((name) => !dbNames.has(name))
+      .filter((name) => !dbNames.has(String(name).trim().toLowerCase()))
       .slice(0, TOP_PRODUCTS_LIMIT)
       .map((name, index) => ({
         name,
         count: Math.max(1, GEMINI_BASE_SCORE - index * 5),
+        source: 'AI',
       }));
 
     const finalProducts = [...dbProducts, ...aiRankedProducts]
       .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
-      .slice(0, TOP_PRODUCTS_LIMIT);
+      .slice(0, TOP_PRODUCTS_LIMIT * 2); // Keep more before catalogue filtering
 
     mergedCategories.push({
       ...category,
@@ -861,74 +857,136 @@ const mergeGeminiProductsIntoCategories = async (categories = []) => {
   return mergedCategories;
 };
 
+// ─── Catalogue matching step ─────────────────────────────────────────
+
+const applyCatalogueMatching = async (categories = []) => {
+  // Collect ALL product names across all categories
+  const allProductNames = [];
+  categories.forEach((cat) => {
+    (cat.products || []).forEach((p) => {
+      allProductNames.push(p.name);
+    });
+  });
+
+  // Match all at once against master catalogue
+  const catalogueMap = await matchAgainstCatalogue(allProductNames);
+
+  log.info({
+    info: 'Catalogue matching complete',
+    totalGenerated: allProductNames.length,
+    totalMatched: catalogueMap.size,
+  });
+
+  // Filter each category's products
+  return categories.map((category) => ({
+    ...category,
+    products: filterByCatalogue(category.products, catalogueMap).slice(0, TOP_PRODUCTS_LIMIT),
+  }));
+};
+
+// ─── Category count mapper ───────────────────────────────────────────
+
 const mapCountsToCategories = (categoryProductCounts) =>
   Object.entries(categoryProductCounts)
     .map(([name, products]) => ({
       name,
       products: Object.entries(products)
-        .map(([productName, count]) => ({ name: productName, count }))
+        .map(([productName, count]) => ({ name: productName, count, source: 'DB' }))
         .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
         .slice(0, TOP_PRODUCTS_LIMIT),
     }))
     .sort((left, right) => left.name.localeCompare(right.name));
 
+// ─── Main builder ────────────────────────────────────────────────────
+
 const buildPincodeCatalog = async (pincode) => {
   const normalizedPincode = String(pincode);
-  const shops = await shopGeoService.getShopsByPincode(normalizedPincode);
+
+  log.info({ info: `Building geo catalog for pincode: ${normalizedPincode}` });
+
+  let shops = [];
+  try {
+    shops = await shopGeoService.getShopsByPincode(normalizedPincode);
+  } catch (error) {
+    log.error({ error: `Shop lookup failed for pincode ${normalizedPincode}`, details: error.message });
+    shops = [];
+  }
+
   const shopIds = shops.map((shop) => Number(shop.shopId)).filter(Boolean);
 
   let categories = [];
   let usedFallback = false;
+  let buildStatus = 'SUCCESS';
 
   if (shopIds.length) {
-    const retailerProducts = await RetailerCatalog.find({
-      shopId: { $in: shopIds },
-      catalog: { $ne: null },
-    })
-      .lean()
-      .exec();
+    try {
+      const retailerProducts = await RetailerCatalog.find({
+        shopId: { $in: shopIds },
+        catalog: { $ne: null },
+      })
+        .lean()
+        .exec();
 
-    const productIds = retailerProducts
-      .map((item) => item?.catalog?._id)
-      .filter((id) => Types.ObjectId.isValid(id))
-      .map((id) => new Types.ObjectId(id));
+      const productIds = retailerProducts
+        .map((item) => item?.catalog?._id)
+        .filter((id) => Types.ObjectId.isValid(id))
+        .map((id) => new Types.ObjectId(id));
 
-    const masterProducts = productIds.length
-      ? await Product.find({ _id: { $in: productIds } })
-          .select('_id catPnm prdNm')
-          .lean()
-          .exec()
-      : [];
+      const masterProducts = productIds.length
+        ? await MongoProduct.find({ _id: { $in: productIds } })
+            .select('_id catPnm prdNm')
+            .lean()
+            .exec()
+        : [];
 
-    const productMap = new Map(masterProducts.map((product) => [String(product._id), product]));
-    const categoryProductCounts = {};
+      const productMap = new Map(masterProducts.map((p) => [String(p._id), p]));
+      const categoryProductCounts = {};
 
-    retailerProducts.forEach((retailerDoc) => {
-      const masterProduct = productMap.get(String(retailerDoc?.catalog?._id));
-      const productName = normalizeProduct(retailerDoc?.catalog?.prdNm || masterProduct?.prdNm || '');
-      const categoryName = getCategoryName(retailerDoc, masterProduct);
+      retailerProducts.forEach((retailerDoc) => {
+        const masterProduct = productMap.get(String(retailerDoc?.catalog?._id));
+        const productName = exactProductName(retailerDoc?.catalog?.prdNm || masterProduct?.prdNm || '');
+        const categoryName = getCategoryName(retailerDoc, masterProduct);
 
-      if (!productName || !categoryName) {
-        return;
+        if (!productName || !categoryName) return;
+
+        categoryProductCounts[categoryName] = categoryProductCounts[categoryName] || {};
+        categoryProductCounts[categoryName][productName] =
+          (categoryProductCounts[categoryName][productName] || 0) + 1;
+      });
+
+      categories = mapCountsToCategories(categoryProductCounts);
+
+      // Merge AI/Gemini suggestions
+      categories = await mergeAIProductsIntoCategories(categories);
+
+      // ★ CRITICAL: Match against master catalogue — only keep verified products
+      categories = await applyCatalogueMatching(categories);
+
+      const uniqueProducts = categories.reduce((count, cat) => count + cat.products.length, 0);
+      if (categories.length < 2 || uniqueProducts < 5) {
+        usedFallback = true;
+        buildStatus = 'PARTIAL';
+        const fallbackCategories = await buildFallbackCategories();
+        // Also catalogue-match fallback products
+        const matchedFallback = await applyCatalogueMatching(fallbackCategories);
+        categories = [...categories, ...matchedFallback];
       }
-
-      categoryProductCounts[categoryName] = categoryProductCounts[categoryName] || {};
-      categoryProductCounts[categoryName][productName] =
-        (categoryProductCounts[categoryName][productName] || 0) + 1;
-    });
-
-    categories = mapCountsToCategories(categoryProductCounts);
-    categories = await mergeGeminiProductsIntoCategories(categories);
-
-    const uniqueProducts = categories.reduce((count, category) => count + category.products.length, 0);
-    if (categories.length < 2 || uniqueProducts < 5) {
+    } catch (error) {
+      log.error({ error: `Retailer aggregation failed for pincode ${normalizedPincode}`, details: error.message });
       usedFallback = true;
+      buildStatus = 'FALLBACK';
       categories = await buildFallbackCategories();
+      categories = await applyCatalogueMatching(categories);
     }
   } else {
     usedFallback = true;
+    buildStatus = 'FALLBACK';
     categories = await buildFallbackCategories();
+    categories = await applyCatalogueMatching(categories);
   }
+
+  // Remove empty categories (no catalogue matches)
+  categories = categories.filter((cat) => cat.products && cat.products.length > 0);
 
   const primaryLocation = shops[0] || {};
 
@@ -942,25 +1000,26 @@ const buildPincodeCatalog = async (pincode) => {
         state: primaryLocation.state || null,
         country: primaryLocation.country || 'India',
         categories,
+        lastBuildAt: new Date(),
+        buildStatus,
       },
     },
-    {
-      new: true,
-      upsert: true,
-      setDefaultsOnInsert: true,
-    },
+    { new: true, upsert: true, setDefaultsOnInsert: true },
   );
 
   log.info({
     info: 'Geo pincode catalog built',
     pincode: normalizedPincode,
     categories: categories.length,
+    totalProducts: categories.reduce((c, cat) => c + cat.products.length, 0),
     usedFallback,
+    buildStatus,
   });
 
   return {
     success: true,
     usedFallback,
+    buildStatus,
     shopCount: shopIds.length,
     categories: document.categories,
     document,
@@ -972,82 +1031,18 @@ module.exports = {
 };
 ```
 
-## What The Hybrid Merge Above Is Doing
+---
 
-This added helper:
+### File 7: `backend/catalogue_mgmt_service/src/apis/services/v1/geoHierarchy.service.js`
 
-```js
-mergeGeminiProductsIntoCategories(categories)
-```
-
-does the following:
-
-1. takes the DB-generated category product list
-2. gets Gemini-style category suggestions from `ai.service.js`
-3. normalizes those names
-4. removes duplicates already found from DB
-5. assigns AI scores
-6. merges both product sets
-7. returns final top products
-
-Meaning:
-
-- if nearby shops strongly sell `amul gold milk`, it stays high
-- if Gemini adds `paneer` and nearby DB is weak for paneer, paneer can still appear
-- result becomes both:
-  - locally relevant
-  - category complete
-
-## `backend/catalogue_mgmt_service/src/apis/services/v1/geoHierarchy.service.js`
+**Action: CREATE new file**
 
 What this code does:
 
-- this is the Phase 2 service
-- rebuilds hierarchy catalogs above pincode level
-- provides fallback resolution logic
-- applies top products into `customcatalog`
-
-This file handles:
-
-- pincode -> city -> state -> country fallback
-- `/geo/apply`
-- hierarchy rebuild after cron execution
-
-Detailed responsibilities:
-
-### `rebuildHierarchyCatalogs()`
-
-- reads all `PINCODE` docs from `geo_catalogs`
-- groups them by city
-- groups them by state
-- groups them by country
-- aggregates product counts
-- writes merged documents for:
-  - `CITY`
-  - `STATE`
-  - `COUNTRY`
-
-### `getGeoCatalogWithFallback()`
-
-Lookup order:
-
-1. exact pincode
-2. city
-3. state
-4. country
-
-### `applyGeoCatalogToShop()`
-
-- resolve best geo catalog
-- flatten category products
-- write them into `customcatalog`
-- mark:
-  - `productNameStatus = UNVERIFIED`
-
-When to test this:
-
-- only after `POST /geo/test/pincode` is working
-- and after a matching `geo_catalogs` document exists
+- Phase 2 service for hierarchy rebuild and apply
+- Rebuilds `CITY`, `STATE`, `COUNTRY` level catalogs by aggregating `PINCODE` documents
+- Provides fallback resolution: `PINCODE → CITY → STATE → COUNTRY`
+- `/geo/apply` — applies geo catalog products to a shop's `customcatalog`
 
 ```js
 const { Logger: log } = require('sarvm-utility');
@@ -1063,10 +1058,7 @@ const aggregateCategories = (documents = []) => {
   documents.forEach((document) => {
     (document?.categories || []).forEach((category) => {
       const categoryName = String(category?.name || '').trim().toLowerCase();
-
-      if (!categoryName) {
-        return;
-      }
+      if (!categoryName) return;
 
       if (!categoryMap.has(categoryName)) {
         categoryMap.set(categoryName, new Map());
@@ -1076,12 +1068,13 @@ const aggregateCategories = (documents = []) => {
 
       (category?.products || []).forEach((product) => {
         const productName = String(product?.name || '').trim().toLowerCase();
+        if (!productName) return;
 
-        if (!productName) {
-          return;
-        }
-
-        productMap.set(productName, (productMap.get(productName) || 0) + Number(product?.count || 0));
+        productMap.set(productName, {
+          count: (productMap.get(productName)?.count || 0) + Number(product?.count || 0),
+          catalogueProductId: product.catalogueProductId || productMap.get(productName)?.catalogueProductId || null,
+          source: product.source || 'DB',
+        });
       });
     });
   });
@@ -1090,25 +1083,20 @@ const aggregateCategories = (documents = []) => {
     .map(([name, productMap]) => ({
       name,
       products: Array.from(productMap.entries())
-        .map(([productName, count]) => ({ name: productName, count }))
-        .sort((left, right) => right.count - left.count || left.name.localeCompare(right.name))
+        .map(([productName, data]) => ({
+          name: productName,
+          count: data.count,
+          catalogueProductId: data.catalogueProductId,
+          source: data.source,
+        }))
+        .sort((l, r) => r.count - l.count || l.name.localeCompare(r.name))
         .slice(0, 10),
     }))
-    .sort((left, right) => left.name.localeCompare(right.name));
+    .sort((l, r) => l.name.localeCompare(r.name));
 };
 
 const upsertGeoLevel = async (filter, payload) =>
-  GeoCatalog.findOneAndUpdate(
-    filter,
-    {
-      $set: payload,
-    },
-    {
-      upsert: true,
-      new: true,
-      setDefaultsOnInsert: true,
-    },
-  );
+  GeoCatalog.findOneAndUpdate(filter, { $set: payload }, { upsert: true, new: true, setDefaultsOnInsert: true });
 
 const rebuildHierarchyCatalogs = async () => {
   const pincodeCatalogs = await GeoCatalog.find({ level: 'PINCODE' }).lean().exec();
@@ -1132,12 +1120,10 @@ const rebuildHierarchyCatalogs = async () => {
       const key = String(location.city).toLowerCase();
       cityGroups.set(key, [...(cityGroups.get(key) || []), catalog]);
     }
-
     if (location?.state) {
       const key = String(location.state).toLowerCase();
       stateGroups.set(key, [...(stateGroups.get(key) || []), catalog]);
     }
-
     if (location?.country) {
       const key = String(location.country).toLowerCase();
       countryGroups.set(key, [...(countryGroups.get(key) || []), catalog]);
@@ -1148,13 +1134,7 @@ const rebuildHierarchyCatalogs = async () => {
     const source = locationByPincode.get(String(documents[0].pincode)) || documents[0];
     await upsertGeoLevel(
       { level: 'CITY', city: source.city },
-      {
-        level: 'CITY',
-        city: source.city,
-        state: source.state || null,
-        country: source.country || 'India',
-        categories: aggregateCategories(documents),
-      },
+      { level: 'CITY', city: source.city, state: source.state || null, country: source.country || 'India', categories: aggregateCategories(documents), lastBuildAt: new Date(), buildStatus: 'SUCCESS' },
     );
   }
 
@@ -1162,12 +1142,7 @@ const rebuildHierarchyCatalogs = async () => {
     const source = locationByPincode.get(String(documents[0].pincode)) || documents[0];
     await upsertGeoLevel(
       { level: 'STATE', state: source.state },
-      {
-        level: 'STATE',
-        state: source.state,
-        country: source.country || 'India',
-        categories: aggregateCategories(documents),
-      },
+      { level: 'STATE', state: source.state, country: source.country || 'India', categories: aggregateCategories(documents), lastBuildAt: new Date(), buildStatus: 'SUCCESS' },
     );
   }
 
@@ -1175,11 +1150,7 @@ const rebuildHierarchyCatalogs = async () => {
     const source = locationByPincode.get(String(documents[0].pincode)) || documents[0];
     await upsertGeoLevel(
       { level: 'COUNTRY', country: source.country || 'India' },
-      {
-        level: 'COUNTRY',
-        country: source.country || 'India',
-        categories: aggregateCategories(documents),
-      },
+      { level: 'COUNTRY', country: source.country || 'India', categories: aggregateCategories(documents), lastBuildAt: new Date(), buildStatus: 'SUCCESS' },
     );
   }
 
@@ -1194,45 +1165,20 @@ const rebuildHierarchyCatalogs = async () => {
 
 const getGeoCatalogWithFallback = async ({ pincode, city, state, country }) => {
   if (pincode) {
-    const pincodeCatalog = await GeoCatalog.findOne({ level: 'PINCODE', pincode: String(pincode) })
-      .sort({ updatedAt: -1 })
-      .lean()
-      .exec();
-
-    if (pincodeCatalog) {
-      return pincodeCatalog;
-    }
+    const doc = await GeoCatalog.findOne({ level: 'PINCODE', pincode: String(pincode) }).sort({ updatedAt: -1 }).lean().exec();
+    if (doc) return doc;
   }
-
   if (city) {
-    const cityCatalog = await GeoCatalog.findOne({ level: 'CITY', city })
-      .sort({ updatedAt: -1 })
-      .lean()
-      .exec();
-
-    if (cityCatalog) {
-      return cityCatalog;
-    }
+    const doc = await GeoCatalog.findOne({ level: 'CITY', city }).sort({ updatedAt: -1 }).lean().exec();
+    if (doc) return doc;
   }
-
   if (state) {
-    const stateCatalog = await GeoCatalog.findOne({ level: 'STATE', state })
-      .sort({ updatedAt: -1 })
-      .lean()
-      .exec();
-
-    if (stateCatalog) {
-      return stateCatalog;
-    }
+    const doc = await GeoCatalog.findOne({ level: 'STATE', state }).sort({ updatedAt: -1 }).lean().exec();
+    if (doc) return doc;
   }
-
   if (country) {
-    return GeoCatalog.findOne({ level: 'COUNTRY', country })
-      .sort({ updatedAt: -1 })
-      .lean()
-      .exec();
+    return GeoCatalog.findOne({ level: 'COUNTRY', country }).sort({ updatedAt: -1 }).lean().exec();
   }
-
   return null;
 };
 
@@ -1247,10 +1193,7 @@ const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
   });
 
   if (!catalog) {
-    return {
-      success: false,
-      message: 'No geo catalog found for the supplied hierarchy',
-    };
+    return { success: false, message: 'No geo catalog found for the supplied hierarchy' };
   }
 
   const retailerDoc = await RetailerCatalog.findOne({ shopId: numericShopId }).select('retailerId guid').lean().exec();
@@ -1307,22 +1250,17 @@ module.exports = {
 };
 ```
 
-## `backend/catalogue_mgmt_service/src/apis/controllers/v1/geo.js`
+---
+
+### File 8: `backend/catalogue_mgmt_service/src/apis/controllers/v1/geo.js`
+
+**Action: CREATE new file**
 
 What this code does:
 
-- exposes service methods to HTTP routes
-- keeps response shape API-friendly
-
-Endpoints handled:
-
-- `POST /geo/test/pincode`
-- `POST /geo/apply`
-- `GET /geo/catalog`
-
-Testing note:
-
-- for Postman validation, Phase 1 starts with `POST /geo/test/pincode`
+- Exposes all geo service methods as HTTP endpoints
+- Includes error handling that returns proper JSON error responses
+- Includes manual cron trigger endpoint for testing
 
 ```js
 const { Logger: log } = require('sarvm-utility');
@@ -1331,34 +1269,97 @@ const { buildPincodeCatalog } = require('../../services/v1/pincodeCatalogBuilder
 const {
   applyGeoCatalogToShop,
   getGeoCatalogWithFallback,
+  rebuildHierarchyCatalogs,
 } = require('../../services/v1/geoHierarchy.service');
 const shopGeoService = require('../../services/v1/shopGeo.service');
+
+// ─── Phase 1: Test pincode catalog ───────────────────────────────────
 
 const testPincodeCatalog = async (req, res, next) => {
   try {
     const { pincode } = req.body;
+
+    if (!pincode) {
+      return res.status(400).json({ success: false, message: 'pincode is required in request body' });
+    }
+
     const result = await buildPincodeCatalog(pincode);
+
     return res.status(200).json({
       success: true,
+      pincode: String(pincode),
+      buildStatus: result.buildStatus,
       usedFallback: result.usedFallback,
+      shopCount: result.shopCount,
+      categoryCount: result.categories.length,
+      totalProducts: result.categories.reduce((c, cat) => c + (cat.products || []).length, 0),
       categories: result.categories,
     });
   } catch (error) {
-    log.error({ error: 'Error while testPincodeCatalog', details: error.message });
-    next(error);
+    log.error({ error: 'Error in testPincodeCatalog', details: error.message, stack: error.stack });
+    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
   }
 };
+
+// ─── Phase 1: Test shop catalog (resolves pincode from shopId) ───────
+
+const testShopCatalog = async (req, res, next) => {
+  try {
+    const { shopId } = req.body;
+
+    if (!shopId) {
+      return res.status(400).json({ success: false, message: 'shopId is required in request body' });
+    }
+
+    const location = await shopGeoService.getShopLocation(Number(shopId));
+
+    if (!location?.pincode) {
+      return res.status(404).json({
+        success: false,
+        message: `Pincode not found for shopId ${shopId}. Shop may not have geo metadata.`,
+      });
+    }
+
+    const result = await buildPincodeCatalog(location.pincode);
+
+    return res.status(200).json({
+      success: true,
+      shopId: Number(shopId),
+      pincode: location.pincode,
+      city: location.city || null,
+      state: location.state || null,
+      buildStatus: result.buildStatus,
+      usedFallback: result.usedFallback,
+      shopCount: result.shopCount,
+      categoryCount: result.categories.length,
+      totalProducts: result.categories.reduce((c, cat) => c + (cat.products || []).length, 0),
+      categories: result.categories,
+    });
+  } catch (error) {
+    log.error({ error: 'Error in testShopCatalog', details: error.message, stack: error.stack });
+    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+  }
+};
+
+// ─── Phase 2: Apply geo catalog to a shop ────────────────────────────
 
 const applyGeoCatalog = async (req, res, next) => {
   try {
     const { shopId, pincode } = req.body;
+
+    if (!shopId) {
+      return res.status(400).json({ success: false, message: 'shopId is required in request body' });
+    }
+
     const result = await applyGeoCatalogToShop({ shopId, pincode });
     return res.status(200).json(result);
   } catch (error) {
-    log.error({ error: 'Error while applyGeoCatalog', details: error.message });
-    next(error);
+    log.error({ error: 'Error in applyGeoCatalog', details: error.message, stack: error.stack });
+    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
   }
 };
+
+// ─── Phase 2: Get resolved geo catalog (with fallback) ───────────────
 
 const getResolvedGeoCatalog = async (req, res, next) => {
   try {
@@ -1371,148 +1372,68 @@ const getResolvedGeoCatalog = async (req, res, next) => {
       country: location?.country,
     });
 
-    return res.status(200).json({
-      success: true,
-      catalog,
-    });
+    if (!catalog) {
+      return res.status(404).json({ success: false, message: 'No geo catalog found for given parameters' });
+    }
+
+    return res.status(200).json({ success: true, catalog });
   } catch (error) {
-    log.error({ error: 'Error while getResolvedGeoCatalog', details: error.message });
-    next(error);
+    log.error({ error: 'Error in getResolvedGeoCatalog', details: error.message, stack: error.stack });
+    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
   }
 };
 
-module.exports = {
-  testPincodeCatalog,
-  applyGeoCatalog,
-  getResolvedGeoCatalog,
-};
-```
+// ─── Phase 2: Manual cron trigger for testing ────────────────────────
 
-## Better API Testing Option: Test By `shopId`
-
-Yes, this is a better testing flow.
-
-Why:
-
-- in real usage you usually know the `shopId`
-- shop metadata can be used to resolve pincode automatically
-- Postman can show:
-  - resolved shop
-  - resolved pincode
-  - top products by category
-
-Recommended approach:
-
-1. send `shopId`
-2. backend fetches shop geo details
-3. backend extracts `pincode`
-4. backend builds geo catalog for that pincode
-5. response includes:
-   - `shopId`
-   - `pincode`
-   - `categories`
-
-Suggested new endpoint:
-
-- `POST /geo/test/shop`
-
-Suggested request body:
-
-```json
-{
-  "shopId": 1234
-}
-```
-
-Suggested response:
-
-```json
-{
-  "success": true,
-  "shopId": 1234,
-  "pincode": "560100",
-  "city": "Bengaluru",
-  "state": "Karnataka",
-  "categories": [
-    {
-      "name": "dairy",
-      "products": [
-        { "name": "amul gold milk", "count": 120 },
-        { "name": "nandini milk", "count": 90 }
-      ]
-    }
-  ]
-}
-```
-
-This is useful for Postman because you do not need to manually know the pincode first.
-
-## Add This In `backend/catalogue_mgmt_service/src/apis/controllers/v1/geo.js`
-
-What this code does:
-
-- accepts `shopId`
-- resolves shop location
-- gets pincode from shop metadata
-- calls existing `buildPincodeCatalog()`
-- returns top products
-
-Add:
-
-```js
-const testShopCatalog = async (req, res, next) => {
+const triggerCronManually = async (req, res, next) => {
   try {
-    const { shopId } = req.body;
-    const location = await shopGeoService.getShopLocation(Number(shopId));
+    const { runGeoCatalogJobOnce } = require('../.././../jobs/geoCatalog.job');
 
-    if (!location?.pincode) {
-      return res.status(404).json({
-        success: false,
-        message: 'Pincode not found for the given shopId',
-      });
-    }
-
-    const result = await buildPincodeCatalog(location.pincode);
-
-    return res.status(200).json({
+    // Run asynchronously — respond immediately
+    res.status(202).json({
       success: true,
-      shopId: Number(shopId),
-      pincode: location.pincode,
-      city: location.city || null,
-      state: location.state || null,
-      categories: result.categories,
-      usedFallback: result.usedFallback,
+      message: 'Geo catalog cron job triggered. Check server logs for progress.',
     });
+
+    // Execute in background
+    runGeoCatalogJobOnce()
+      .then(() => log.info({ info: 'Manual cron trigger completed successfully' }))
+      .catch((error) => log.error({ error: 'Manual cron trigger failed', details: error.message }));
   } catch (error) {
-    log.error({ error: 'Error while testShopCatalog', details: error.message });
-    next(error);
+    log.error({ error: 'Error triggering cron', details: error.message });
+    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
   }
 };
-```
 
-And export it:
-
-```js
 module.exports = {
   testPincodeCatalog,
   testShopCatalog,
   applyGeoCatalog,
   getResolvedGeoCatalog,
+  triggerCronManually,
 };
 ```
 
-## `backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js`
+---
+
+### File 9: `backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js`
+
+**Action: CREATE new file**
 
 What this code does:
 
-- creates the new `/geo` route group
-- mounts geo APIs under CMS base path
+- Mounts all geo endpoints under `/geo`
+- All routes use proper logging
 
-Final URLs become:
+Final URLs (base: `http://localhost:2210/cms/apis/v1`):
 
-- `POST http://localhost:2210/cms/apis/geo/test/pincode`
-- `POST http://localhost:2210/cms/apis/geo/apply`
-- `GET http://localhost:2210/cms/apis/geo/catalog`
+| Method | URL | Purpose | Phase |
+|--------|-----|---------|-------|
+| POST | `/geo/test/pincode` | Build catalog for one pincode | 1 |
+| POST | `/geo/test/shop` | Build catalog by shopId | 1 |
+| POST | `/geo/apply` | Apply geo catalog to shop | 2 |
+| GET | `/geo/catalog` | Get catalog with fallback | 2 |
+| POST | `/geo/cron/trigger` | Manually trigger cron job | 2 |
 
 ```js
 const express = require('express');
@@ -1522,11 +1443,18 @@ const GeoController = require('../../controllers/v1/geo');
 
 const router = express.Router();
 
+// Phase 1 — test endpoints
 router.post('/test/pincode', async (req, res, next) => {
   log.info({ info: 'Geo route :: test pincode catalog' });
   return GeoController.testPincodeCatalog(req, res, next);
 });
 
+router.post('/test/shop', async (req, res, next) => {
+  log.info({ info: 'Geo route :: test shop catalog' });
+  return GeoController.testShopCatalog(req, res, next);
+});
+
+// Phase 2 — production endpoints
 router.post('/apply', async (req, res, next) => {
   log.info({ info: 'Geo route :: apply geo catalog' });
   return GeoController.applyGeoCatalog(req, res, next);
@@ -1537,67 +1465,30 @@ router.get('/catalog', async (req, res, next) => {
   return GeoController.getResolvedGeoCatalog(req, res, next);
 });
 
+// Phase 2 — manual cron trigger for testing
+router.post('/cron/trigger', async (req, res, next) => {
+  log.info({ info: 'Geo route :: manual cron trigger' });
+  return GeoController.triggerCronManually(req, res, next);
+});
+
 module.exports = router;
 ```
 
-## Add This In `backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js`
+---
 
-What this route does:
+### File 10: `backend/catalogue_mgmt_service/src/jobs/geoCatalog.job.js`
 
-- allows Postman testing directly by `shopId`
-
-Add:
-
-```js
-router.post('/test/shop', async (req, res, next) => {
-  log.info({ info: 'Geo route :: test shop catalog' });
-  return GeoController.testShopCatalog(req, res, next);
-});
-```
-
-## `backend/catalogue_mgmt_service/src/jobs/geoCatalog.job.js`
+**Action: CREATE new file in new `jobs` directory**
 
 What this code does:
 
-- runs full geo-catalog generation every night at `2:00 AM`
-- processes all shop pincodes
-- rebuilds higher-level geo hierarchy catalogs after pincode generation
+- Runs full geo-catalog generation nightly at `2:00 AM IST`
+- **Processes ONE pincode at a time** (sequential) to avoid overloading Gemini API rate limits
+- Adds proper error handling per pincode — one failure does not stop the whole job
+- Rebuilds hierarchy after all pincodes
+- Includes delay between pincodes (configurable)
 
-Cron schedule:
-
-```txt
-0 2 * * *
-```
-
-Meaning:
-
-- minute `0`
-- hour `2`
-- every day
-
-Phase behavior:
-
-- Phase 1:
-  - you do **not** need cron first
-  - manually test with `POST /geo/test/pincode`
-- Phase 2:
-  - enable cron and let it generate all geo catalogs nightly
-
-Order inside cron:
-
-1. get all shops
-2. collect all unique pincodes
-3. build pincode catalog for each pincode
-4. rebuild city/state/country hierarchy
-
-Recommended production flow:
-
-- 2 AM cron
-- logs success/failure
-- can later add metrics for:
-  - processed pincodes
-  - fallback-used pincodes
-  - generated category counts
+Cron schedule: `0 2 * * *` → minute 0, hour 2, every day
 
 ```js
 const cron = require('node-cron');
@@ -1608,27 +1499,92 @@ const { buildPincodeCatalog } = require('../apis/services/v1/pincodeCatalogBuild
 const { rebuildHierarchyCatalogs } = require('../apis/services/v1/geoHierarchy.service');
 
 let isStarted = false;
+let isRunning = false;
 
+// Delay helper to avoid overloading APIs
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Configurable delay between pincode builds (ms)
+const PINCODE_DELAY_MS = parseInt(process.env.GEO_CRON_PINCODE_DELAY_MS || '2000', 10);
+
+/**
+ * Run the full geo catalog job once.
+ * Processes ONE pincode at a time (sequential, not parallel).
+ * Each pincode may call Gemini API, so we space them out.
+ */
 const runGeoCatalogJobOnce = async () => {
-  const shopLocations = await shopGeoService.getAllShopLocations();
-  const pincodes = [...new Set(shopLocations.map((shop) => shop?.pincode).filter(Boolean))];
-
-  for (const pincode of pincodes) {
-    await buildPincodeCatalog(pincode);
-  }
-
-  await rebuildHierarchyCatalogs();
-
-  log.info({
-    info: 'Geo catalog job completed',
-    pincodesProcessed: pincodes.length,
-  });
-};
-
-const startGeoCatalogJob = () => {
-  if (isStarted) {
+  if (isRunning) {
+    log.warn({ warn: 'Geo catalog job already running, skipping this invocation' });
     return;
   }
+
+  isRunning = true;
+  const startTime = Date.now();
+
+  try {
+    log.info({ info: 'Geo catalog job started' });
+
+    const shopLocations = await shopGeoService.getAllShopLocations();
+    const pincodes = [...new Set(shopLocations.map((shop) => shop?.pincode).filter(Boolean))];
+
+    log.info({ info: `Geo catalog job: processing ${pincodes.length} pincodes sequentially` });
+
+    let successCount = 0;
+    let failCount = 0;
+
+    // Process ONE pincode at a time
+    for (let i = 0; i < pincodes.length; i++) {
+      const pincode = pincodes[i];
+
+      try {
+        log.info({ info: `Geo catalog job: processing pincode ${pincode} (${i + 1}/${pincodes.length})` });
+        await buildPincodeCatalog(pincode);
+        successCount++;
+      } catch (error) {
+        failCount++;
+        log.error({
+          error: `Geo catalog job: failed for pincode ${pincode}`,
+          details: error.message,
+        });
+        // Continue to next pincode — don't stop the whole job
+      }
+
+      // Delay between pincodes to avoid API rate limits
+      if (i < pincodes.length - 1) {
+        await delay(PINCODE_DELAY_MS);
+      }
+    }
+
+    // Rebuild hierarchy after all pincodes are processed
+    try {
+      await rebuildHierarchyCatalogs();
+      log.info({ info: 'Geo catalog job: hierarchy rebuild complete' });
+    } catch (error) {
+      log.error({ error: 'Geo catalog job: hierarchy rebuild failed', details: error.message });
+    }
+
+    const durationSeconds = Math.round((Date.now() - startTime) / 1000);
+
+    log.info({
+      info: 'Geo catalog job completed',
+      pincodesProcessed: pincodes.length,
+      successCount,
+      failCount,
+      durationSeconds,
+    });
+  } catch (error) {
+    log.error({ error: 'Geo catalog job fatal error', details: error.message, stack: error.stack });
+  } finally {
+    isRunning = false;
+  }
+};
+
+/**
+ * Schedule the nightly cron job.
+ * Runs at 2:00 AM IST every day.
+ */
+const startGeoCatalogJob = () => {
+  if (isStarted) return;
 
   cron.schedule(
     '0 2 * * *',
@@ -1636,7 +1592,7 @@ const startGeoCatalogJob = () => {
       try {
         await runGeoCatalogJobOnce();
       } catch (error) {
-        log.error({ error: 'Geo catalog job failed', details: error.message });
+        log.error({ error: 'Geo catalog cron failed', details: error.message });
       }
     },
     {
@@ -1646,6 +1602,7 @@ const startGeoCatalogJob = () => {
   );
 
   isStarted = true;
+  log.info({ info: 'Geo catalog cron job scheduled at 2:00 AM IST' });
 };
 
 module.exports = {
@@ -1654,15 +1611,27 @@ module.exports = {
 };
 ```
 
-## `backend/catalogue_mgmt_service/src/apis/routes/v1/index.js`
+---
 
-What this code does:
+### File 11: `backend/catalogue_mgmt_service/src/apis/routes/v1/index.js`
 
-- mounts the new geo routes into the main v1 route tree
+**Action: EDIT existing file**
 
-Without this file update:
+What to change: Add the geo router import and mount it.
 
-- `/geo/test/pincode` will not be reachable
+Add this import near the top (after existing imports):
+
+```js
+const geoRouter = require('./geo');
+```
+
+Add this line in the router.use section:
+
+```js
+router.use('/geo', geoRouter);
+```
+
+Full updated file:
 
 ```js
 const express = require('express');
@@ -1696,20 +1665,32 @@ router.use('/dataTree', DataTree);
 module.exports = router;
 ```
 
-## `backend/catalogue_mgmt_service/src/InitApp/index.js`
+---
 
-What this code does:
+### File 12: `backend/catalogue_mgmt_service/src/InitApp/index.js`
 
-- starts DB connections
-- starts the nightly geo cron job
+**Action: EDIT existing file**
 
-Why update here:
+What to change: Add cron job startup after DB connections.
 
-- this is the app startup hook already used by the service
-- best place to initialize recurring background jobs
+Add this import near the top:
+
+```js
+const { startGeoCatalogJob } = require('../jobs/geoCatalog.job');
+```
+
+Add this line after `Mongo.connect()`:
+
+```js
+startGeoCatalogJob();
+```
+
+Full updated file:
 
 ```js
 const {
+  Logger: log,
+  ErrorHandler: { BaseError, INTERNAL_SERVER_ERROR, PAGE_NOT_FOUND_ERROR },
   ReqLogger,
   AuthManager,
 } = require('sarvm-utility');
@@ -1724,8 +1705,8 @@ const sessionName = config.session_name;
 const session = createNamespace(sessionName);
 const SqlDb = require('@db/SQL');
 const { Mongo } = require('@db/index');
-const { startGeoCatalogJob } = require('../jobs/geoCatalog.job');
 const consumer = require('../common/aws/index');
+const { startGeoCatalogJob } = require('../jobs/geoCatalog.job');
 
 const init = async (app) => {
   app.use(AuthManager.decodeAuthToken);
@@ -1762,7 +1743,11 @@ const init = async (app) => {
 
   const dbConnection = new SqlDb();
   dbConnection.connect();
-  await Mongo.connect();
+  Mongo.connect((err) => {
+    if (err) return console.error(err);
+  });
+
+  // Start nightly geo catalog cron job
   startGeoCatalogJob();
 
   // consumer.start()
@@ -1771,427 +1756,230 @@ const init = async (app) => {
 module.exports = init;
 ```
 
-## `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/retailerSchema.js`
+---
 
-What this code does:
+### File 13: `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/retailerSchema.js`
 
-- adds `shopId` index for faster pincode product fetch
+**Action: VERIFY existing file has `shopId` index**
 
-Why important:
+The existing file should have `retailer_Catalog.index({ shopId: 1 })`. If not, add it. This makes pincode product queries fast.
 
-- Phase 1 builder queries `retailercatalog` by `shopId`
-- cron job may query large shop lists
-- this index reduces scan cost
+---
 
-```js
-const mongoose = require('mongoose');
-const Schema = mongoose.Schema;
+### File 14: `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/customCatalogSchema.js`
 
-const retailer_Catalog = new Schema(
-  {
-    shopId: Number,
-    retailerId: String,
-    guid: String,
-    url: String,
-    catalog: Object,
-    category: String,
-  },
-  {
-    timestamps: true,
-  },
-);
+**Action: VERIFY existing file has `UNVERIFIED` enum**
 
-retailer_Catalog.index({ shopId: 1 });
+Ensure `productNameStatus` includes `'UNVERIFIED'` in its enum. This is needed for `/geo/apply`.
 
-const retailerCatalog = mongoose.model('retailercatalog', retailer_Catalog);
+---
 
-module.exports = retailerCatalog;
-```
+### File 15: `.lcl.env` additions for Phase 2
 
-## `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/customCatalogSchema.js`
+**Action: EDIT existing `.lcl.env`**
 
-What this code does:
-
-- extends status enums to allow:
-  - `UNVERIFIED`
-
-Why needed:
-
-- `/geo/apply` inserts auto-suggested products
-- those product names are not manually approved yet
-- requirement says they must be marked:
-  - `productNameStatus = "UNVERIFIED"`
-
-```js
-const mongoose = require('mongoose');
-const Schema = mongoose.Schema;
-
-const customCatalog = new Schema(
-  {
-    shopId: Number,
-    retailerId: String,
-    productName: String,
-    productNameStatus: {
-      type: String,
-      default: 'NEW',
-      enum: ['NEW', 'UNVERIFIED', 'ACCEPTED', 'REJECTED'],
-    },
-    productImage: String,
-    productImageStatus: {
-      type: String,
-      default: 'NEW',
-      enum: ['NEW', 'UNVERIFIED', 'ACCEPTED', 'REJECTED'],
-    },
-    description: {
-      type: String,
-      default: null,
-    },
-    productDescriptionStatus: {
-      type: String,
-      default: 'NEW',
-      enum: ['NEW', 'UNVERIFIED', 'ACCEPTED', 'REJECTED'],
-    },
-    category: String,
-    subCategory: String,
-    productId: String,
-    guid: String,
-    retailerName: String,
-    requestFlag: {
-      type: Boolean,
-      default: false,
-    },
-    updateStatus: {
-      type: String,
-      default: 'NEW',
-      enum: ['NEW', 'APPROVED', 'REJECTED', 'UPDATED'],
-    },
-  },
-  {
-    timestamps: true,
-  },
-);
-
-const requestCustomCatalog = mongoose.model('customCatalog', customCatalog);
-
-module.exports = requestCustomCatalog;
-```
-
-## `backend/catalogue_mgmt_service/.lcl.env`
-
-What this config does:
-
-- makes backend run against local Postgres and Mongo
-- gives safe local defaults for optional runtime config
-- supports testing without production services
-
-Phase 1 use:
-
-- required for local backend startup
-
-Phase 2 use:
-
-- can later add Gemini variables here such as:
+Add these lines at the bottom:
 
 ```env
-GEMINI_API_KEY=your_key
-GEMINI_MODEL=gemini-1.5-pro
-```
+# Gemini AI (Phase 2)
+GEMINI_API_KEY=your_gemini_api_key_here
+GEMINI_MODEL=gemini-2.0-flash
 
-```env
-NODE_ENV=development
-ENV=dev
-BUILD_NUMBER=100
-
-HOST=localhost
-HOST_PORT=2210
-HOST_SERVICE_NAME=cms
-
-MONGO_DB_HOST=mongodb://127.0.0.1:27017/metadata
-MONGO_DB_USER=household_app
-MONGO_DB_PASSWORD=ITJKHjCzJgCZFJ8R
-MONGO_DB_PORT=27017
-MONGO_DB_CLUSTER=cluster0
-MONGO_DB_DATABASE=metadata
-MONGO_DB_COLLECTION=mastercatalogs
-
-SQL_DB_HOST=localhost
-SQL_DB_USER=postgres
-SQL_DB_PASSWORD=omkar
-SQL_DB_PORT=5432
-SQL_DB_NAME=cms
-SQL_DB_DIALECT=postgres
-SQL_DB_NAME_META=meta
-
-AWS_BUCKET=dev.sarvm.com
-AWS_EXPIRATION=52000
-LOAD_BALANCER=http://localhost
-CDN_URL=https://uat-static.sarvm.ai
-CATALOG_FOLDER=catalog_url
-QUEUE_URL=http://localhost/queue
-ENVIRONMENT=dev
-MEDIA_S3=http://localhost/media
-TOP_PRODUCTS_LIMIT=10
-RADIUS=25
-CITY_LAT_LON=[{"city":"Bengaluru","lat":12.9716,"lon":77.5946}]
-
-SYSTEM_TOKEN=your_system_token_here
-PINO_LOG_LEVEL='info'
-```
-
-## Gemini Phase 2 Add-On
-
-This section is for the later implementation phase.
-
-### Where Gemini should be integrated
-
-Best file:
-
-- `backend/catalogue_mgmt_service/src/apis/services/v1/ai.service.js`
-
-Optional dedicated file if you want cleaner separation:
-
-- `backend/catalogue_mgmt_service/src/apis/services/v1/gemini.service.js`
-
-### What Gemini should do
-
-Allowed use cases:
-
-1. generate category-wise top-product suggestions
-2. suggest normalized product forms for noisy retailer names
-3. suggest additional candidate products that are important but underrepresented in nearby DB data
-
-Not allowed as primary source:
-
-- do not use Gemini instead of `retailercatalog`
-- do not use Gemini instead of `products`
-- do not generate full catalogs blindly without real shop data
-
-### Correct Suggested Gemini flow
-
-1. run normal aggregation from nearby real data
-2. build DB category-wise top-product map
-3. call Gemini for each category
-4. ask Gemini for likely top products for that category
-5. normalize Gemini output
-6. remove products already present from DB aggregation
-7. assign Gemini weighted score
-8. merge DB products and Gemini products
-9. sort descending
-10. save final merged list into `geo_catalogs`
-
-### Suggested Gemini method shape
-
-```js
-async function getGeminiFallbackProducts(categoryName, existingProducts = []) {
-  // call Gemini
-  // return array of product names
-}
-```
-
-Better function names for Phase 2:
-
-```js
-async function getGeminiTopProducts(categoryName, existingProducts = []) {
-  // return array of suggested product names for this category
-}
-
-function mergeDbAndGeminiProducts(dbProducts, geminiProducts) {
-  // normalize
-  // dedupe
-  // apply weighted AI score
-  // return sorted merged products
-}
-```
-
-### Suggested Gemini prompt
-
-```txt
-Give me 10 common Indian retail product names for category "dairy".
-Return only a JSON array of short product names.
-Do not include explanation.
-```
-
-### When Gemini should run
-
-- once per category
-- after DB top products are already computed
-- before final sorting/storage
-- not on every product record
-
-So the sequence is:
-
-```txt
-DB nearby products -> category counts -> Gemini category suggestions -> merge -> final top products
+# Geo Cron Configuration
+GEO_CRON_PINCODE_DELAY_MS=2000
 ```
 
 ---
 
-## Phase 1 Postman Testing
+## Data Flow Diagram
 
-### Step 1: Start backend
-
-Run:
-
-```bash
-cd backend/catalogue_mgmt_service
-npm install
-npm run lcl
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BUILD PINCODE CATALOG                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. getShopsByPincode(pincode)                                 │
+│     └─> shopIds[]                                              │
+│                                                                 │
+│  2. RetailerCatalog.find({ shopId: { $in: shopIds } })         │
+│     └─> retailerProducts[]                                     │
+│                                                                 │
+│  3. Group by category, count product name frequency             │
+│     └─> { dairy: { "Amul Gold Milk": 120, ... }, ... }         │
+│                                                                 │
+│  4. For each category: getGeminiCategoryProducts()              │
+│     ├─ Fresh category → generic names (Tomato, Paneer)         │
+│     └─ Packaged category → brand names (Lays, Parle-G)        │
+│                                                                 │
+│  5. Merge DB products + AI products (hybrid ranked list)        │
+│     └─> DB products score by real frequency                     │
+│     └─> AI products score by synthetic declining score          │
+│                                                                 │
+│  ★ 6. matchAgainstCatalogue(allProductNames)                   │
+│     └─> Query Postgres `product` table                         │
+│     └─> Only keep products that exist in catalogue             │
+│                                                                 │
+│  7. Store in geo_catalogs (MongoDB)                             │
+│                                                                 │
+│  8. Return catalogue-matched products only                      │
+│     └─> Frontend shows ONLY valid catalogue products           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-Expected base URL:
+---
 
-```txt
-http://localhost:2210/cms/apis
+## Postman Testing Guide
+
+### Prerequisites
+
+1. MongoDB running locally on port `27017`
+2. PostgreSQL running locally on port `5432` with database `cms`
+3. Backend started: `cd backend/catalogue_mgmt_service && npm run lcl`
+
+Expected base URL: `http://localhost:2210/cms/apis/v1`
+
+### Authorization Header
+
+All requests need the system token:
+
+```
+Authorization: Bearer <your_system_token_from_env>
 ```
 
-### Step 2: Test single pincode catalog build
+---
 
-Method:
+### TEST 1: Health Check
 
-- `POST`
+**When to test:** First, to verify backend is running.
 
-URL:
-
-```txt
-http://localhost:2210/cms/apis/geo/test/pincode
+```
+GET http://localhost:2210/cms/apis/healthcheck
 ```
 
-Headers:
+Expected: `200 OK` with `ts`, `buildNumber`, `serviceName`.
 
-```txt
+---
+
+### TEST 2: Build Catalog by Pincode (Phase 1 — Primary Test)
+
+**When to test:** After health check passes and both DBs are connected.
+
+```
+POST http://localhost:2210/cms/apis/v1/geo/test/pincode
 Content-Type: application/json
-```
 
-Body:
-
-```json
 {
   "pincode": "560100"
 }
 ```
 
-Expected response:
+**What to verify in response:**
 
-- `success = true`
-- `categories` array exists
-- more than one category exists
-- each category has multiple products
-- final product list should represent:
-  - common nearby DB products
-  - plus AI suggested category products
+| Field | Expected |
+|-------|----------|
+| `success` | `true` |
+| `pincode` | `"560100"` |
+| `buildStatus` | `"SUCCESS"`, `"PARTIAL"`, or `"FALLBACK"` |
+| `categoryCount` | `>= 1` |
+| `totalProducts` | `>= 1` |
+| `categories[].products[].name` | Each name must exist in your Postgres `product` table |
+| `categories[].products[].catalogueProductId` | Non-null if catalogue matched |
+| `categories[].products[].source` | `"DB"`, `"AI"`, or `"FALLBACK"` |
 
-### Step 3: Verify Mongo
+**How to verify catalogue matching actually worked:**
 
-Check collection:
+Take any product name from the response, e.g., `"Amul Gold Milk 500ml"`.
+Run this SQL in your Postgres `cms` database:
 
-- `geo_catalogs`
-
-Find document:
-
-```js
-db.geo_catalogs.find({ level: "PINCODE", pincode: "560100" }).pretty()
+```sql
+SELECT id, name FROM product WHERE LOWER(name) = LOWER('Amul Gold Milk 500ml') AND status = 'ACTIVE';
 ```
 
-Verify:
+The product **must exist**. If a generated product does NOT exist in the master catalogue, it will NOT appear in the API response.
 
-- `categories.length > 1`
-- each category has `products`
-- each product has:
-  - `name`
-  - `count`
+---
 
-### Step 4: If low real data
+### TEST 3: Build Catalog by ShopId (Phase 1 — Alternate Test)
 
-Expected behavior:
+**When to test:** If you know a valid shopId in your system.
 
-- fallback categories are inserted
-- API still returns valid category/product structure
-
-This is acceptable in Phase 1 because goal is to validate flow.
-
-### Alternate Phase 1 Test: By `shopId`
-
-This is the better manual test if you already have a valid shop.
-
-Method:
-
-- `POST`
-
-URL:
-
-```txt
-http://localhost:2210/cms/apis/geo/test/shop
 ```
-
-Headers:
-
-```txt
+POST http://localhost:2210/cms/apis/v1/geo/test/shop
 Content-Type: application/json
-```
 
-Body:
-
-```json
 {
   "shopId": 1234
 }
 ```
 
-What backend will do:
+**What to verify:** Same as TEST 2, plus:
 
-1. fetch shop metadata
-2. resolve pincode from shop
-3. build geo catalog for that pincode
-4. merge:
-   - nearby DB common products
-   - Gemini category suggestions
-4. return top products
-
-Expected response:
-
-- `success = true`
-- `shopId` returned
-- `pincode` returned
-- `categories` returned
-- top products visible directly in Postman
-- each category may contain:
-  - real nearby high-frequency products
-  - AI-added complementary products
-
-This is a more practical validation flow than sending only raw pincode.
+| Field | Expected |
+|-------|----------|
+| `shopId` | `1234` |
+| `pincode` | Auto-resolved from shop metadata |
+| `city` | Auto-resolved |
+| `state` | Auto-resolved |
 
 ---
 
-## Phase 2 Postman Testing
+### TEST 4: Verify Mongo Document (After TEST 2 or 3)
 
-### Step 1: Apply geo catalog to a shop
+**When to test:** After a successful build.
 
-Method:
+Open MongoDB shell or Compass:
 
-- `POST`
-
-URL:
-
-```txt
-http://localhost:2210/cms/apis/geo/apply
+```js
+db.geo_catalogs.find({ level: "PINCODE", pincode: "560100" }).pretty()
 ```
 
-Headers:
+**Verify:**
 
-```txt
+- `categories` array exists and is non-empty
+- Each category has `products` array
+- Each product has `name`, `count`, `source`, `catalogueProductId`
+- `buildStatus` is `"SUCCESS"` or `"PARTIAL"`
+- `lastBuildAt` is a recent timestamp
+
+---
+
+### TEST 5: Get Catalog with Fallback (Phase 2)
+
+**When to test:** After pincode document exists.
+
+```
+GET http://localhost:2210/cms/apis/v1/geo/catalog?pincode=560100
+```
+
+Or by shopId:
+
+```
+GET http://localhost:2210/cms/apis/v1/geo/catalog?shopId=1234
+```
+
+**Verify:**
+
+- Returns the matching document
+- Falls back through PINCODE → CITY → STATE → COUNTRY
+
+---
+
+### TEST 6: Apply Geo Catalog to Shop (Phase 2)
+
+**When to test:** After TEST 4 confirms a geo_catalogs document exists.
+
+```
+POST http://localhost:2210/cms/apis/v1/geo/apply
 Content-Type: application/json
-```
 
-Body:
-
-```json
 {
   "shopId": 1234,
   "pincode": "560100"
 }
 ```
 
-Expected response:
+**Expected response:**
 
 ```json
 {
@@ -2202,73 +1990,48 @@ Expected response:
 }
 ```
 
-### Step 2: Verify `customcatalog`
-
-Mongo query:
+**Verify in MongoDB:**
 
 ```js
-db.customcatalog.find({ shopId: 1234 }).pretty()
+db.customcatalogs.find({ shopId: 1234 }).pretty()
 ```
 
-Verify:
-
-- products inserted
-- `productNameStatus = "UNVERIFIED"`
+Check:
+- Products inserted
+- `productNameStatus` = `"UNVERIFIED"`
 - `category` and `subCategory` filled
-
-### Step 3: Fallback catalog lookup test
-
-Optional endpoint:
-
-- `GET http://localhost:2210/cms/apis/geo/catalog?pincode=560100`
-
-Or:
-
-- `GET http://localhost:2210/cms/apis/geo/catalog?shopId=1234`
-
-Expected:
-
-- if pincode-level doc exists, return PINCODE
-- else fallback to CITY
-- else STATE
-- else COUNTRY
-
-Also verify:
-
-- categories are not purely DB only if AI merge is enabled
-- categories are not purely Gemini only unless DB is absent
-- final list is hybrid
 
 ---
 
-## Cron Testing
+### TEST 7: Manual Cron Trigger (Phase 2)
 
-### Manual cron validation
+**When to test:** After all above tests pass, to test the full cron flow.
 
-Before waiting for `2 AM`, you should manually call the builder logic or temporarily invoke:
+```
+POST http://localhost:2210/cms/apis/v1/geo/cron/trigger
+Content-Type: application/json
+```
 
-- `runGeoCatalogJobOnce()`
+**Expected response:**
 
-Expected outcome:
+```json
+{
+  "success": true,
+  "message": "Geo catalog cron job triggered. Check server logs for progress."
+}
+```
 
-1. all pincodes processed
-2. pincode docs created
-3. city/state/country docs created
+**Important:** This returns `202 Accepted` immediately. The job runs in the background. Check server logs for:
 
-### Production cron expectation
+```
+Geo catalog job: processing pincode 560100 (1/N)
+Geo catalog job: processing pincode 560101 (2/N)
+...
+Geo catalog job completed - pincodesProcessed: N, successCount: X, failCount: Y
+Geo catalog job: hierarchy rebuild complete
+```
 
-At every `2:00 AM`:
-
-1. job starts
-2. fetches all shop locations
-3. gets unique pincodes
-4. builds pincode catalogs
-5. rebuilds hierarchy catalogs
-6. logs completion
-
-### What to verify after 2 AM run
-
-Mongo checks:
+**Verify hierarchy after job completes:**
 
 ```js
 db.geo_catalogs.find({ level: "PINCODE" }).count()
@@ -2279,284 +2042,85 @@ db.geo_catalogs.find({ level: "COUNTRY" }).count()
 
 ---
 
-## API Test Sequence In Postman
+## API Test Sequence Summary
 
 Follow this exact order:
 
-1. `POST /geo/test/shop`
-   - best manual test if you know a valid `shopId`
-2. `POST /geo/test/pincode`
-   - direct pincode test for `560100`
-3. Mongo `geo_catalogs` verification
-   - confirm saved output
-   - confirm mixed DB + Gemini product list
-4. `GET /geo/catalog`
-   - verify fetch and fallback path
-5. `POST /geo/apply`
-   - apply results to a shop
-6. Mongo `customcatalog` verification
-   - confirm `UNVERIFIED` rows inserted
-7. cron/manual job validation
-   - confirm hierarchy creation
+| Step | API | Purpose | Phase |
+|------|-----|---------|-------|
+| 1 | `GET /healthcheck` | Verify backend running | 1 |
+| 2 | `POST /v1/geo/test/pincode` | Build catalog for `560100` | 1 |
+| 3 | MongoDB check | Verify `geo_catalogs` document | 1 |
+| 4 | SQL check | Verify returned products exist in catalogue | 1 |
+| 5 | `POST /v1/geo/test/shop` | Build by shopId | 1 |
+| 6 | `GET /v1/geo/catalog` | Fetch with fallback | 2 |
+| 7 | `POST /v1/geo/apply` | Apply to shop | 2 |
+| 8 | MongoDB check | Verify `customcatalogs` | 2 |
+| 9 | `POST /v1/geo/cron/trigger` | Run full cron | 2 |
+| 10 | MongoDB check | Verify hierarchy docs | 2 |
 
 ---
 
-## When To Test Which API
+## Phase 2 Changes After Phase 1 Implementation
 
-### Test `POST /geo/test/shop`
+After Phase 1 is working and tested, make these changes for Phase 2:
 
-Use this first when:
+### 1. Install Gemini SDK
 
-- you know a valid `shopId`
-- you want backend to automatically resolve pincode
-- you want top products shown directly in Postman output
+```bash
+cd backend/catalogue_mgmt_service
+npm install @google/generative-ai
+```
 
-This is the most practical manual validation endpoint.
+### 2. Add Gemini API Key to `.lcl.env`
 
-Use it to verify:
+```env
+GEMINI_API_KEY=your_actual_gemini_api_key
+GEMINI_MODEL=gemini-2.0-flash
+```
 
-- resolved pincode is correct
-- top products come from hybrid merge logic
-- categories look market-relevant
+### 3. Verify `ai.service.js` auto-switches
 
-### Test `POST /geo/test/pincode`
+The `ai.service.js` file already has Phase 2 Gemini code. It checks:
 
-Use this first when:
+```js
+if (!geminiAvailable || !process.env.GEMINI_API_KEY) {
+  // Use fallback (Phase 1 behavior)
+}
+```
 
-- backend is running
-- Mongo is connected
-- you want to validate only pincode `560100`
+Once the SDK is installed and the API key is set, it automatically switches to real Gemini calls. **No code changes needed.**
 
-### Test `POST /geo/apply`
+### 4. Enable the cron job
 
-Use this only after:
+The cron is already initialized in `InitApp/index.js`. It runs at 2 AM IST. To test manually:
 
-- pincode catalog already exists
-- or fallback hierarchy exists
+```
+POST http://localhost:2210/cms/apis/v1/geo/cron/trigger
+```
 
-### Test cron/manual hierarchy rebuild
+### 5. Configure delay between pincodes
 
-Use this after:
+In `.lcl.env`:
 
-- multiple pincode docs exist
-- you are ready for Phase 2
+```env
+GEO_CRON_PINCODE_DELAY_MS=2000
+```
+
+This adds 2-second delay between processing each pincode, preventing Gemini API rate limit issues.
 
 ---
 
-## Frontend Phase Use
+## Frontend
 
-### Phase 1
+**No frontend changes are needed.**
 
-Use:
+Because the backend already returns only catalogue-matched products, the frontend receives valid product data. The existing `geo-catalog-test` page and any future integration will work as-is.
 
-- `geo-catalog-test` page only
+If you still want the test page for manual validation:
 
-Purpose:
-
-- quickly display category/product output from `560100`
-- simple manual validation UI
-
-### Phase 2
-
-Later you can:
-
-- integrate geo-suggested products into retailer/admin flows
-- add operational dashboard for geo catalog generation status
-- add apply button for a selected shop
-
-## `frontend/hha_web/src/app/lib/services/geo-catalog.service.ts`
-
-What this code does:
-
-- calls the local backend directly
-- triggers Phase 1 pincode test API
-
-Use this only for:
-
-- manual feature validation
-- test screen
-
-Later in Phase 2 you can add:
-
-- `applyGeoCatalog(shopId, pincode)`
-- `getResolvedGeoCatalog(shopId, pincode)`
-
-```ts
-import { Injectable } from '@angular/core';
-import { HttpClient } from '@angular/common/http';
-
-@Injectable({
-  providedIn: 'root',
-})
-export class GeoCatalogService {
-  private readonly baseUrl = 'http://localhost:2210/cms/apis/geo';
-
-  constructor(private http: HttpClient) {}
-
-  runGeoTest() {
-    return this.http.post<{ success: boolean; categories: any[] }>(`${this.baseUrl}/test/pincode`, {
-      pincode: '560100',
-    });
-  }
-}
-```
-
-## `frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test-routing.module.ts`
-
-What this code does:
-
-- gives the test screen its route module
-
-```ts
-import { NgModule } from '@angular/core';
-import { RouterModule, Routes } from '@angular/router';
-
-import { GeoCatalogTestPage } from './geo-catalog-test.page';
-
-const routes: Routes = [
-  {
-    path: '',
-    component: GeoCatalogTestPage,
-  },
-];
-
-@NgModule({
-  imports: [RouterModule.forChild(routes)],
-  exports: [RouterModule],
-})
-export class GeoCatalogTestPageRoutingModule {}
-```
-
-## `frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.module.ts`
-
-What this code does:
-
-- declares the test page
-- wires Angular/Ionic module imports
-
-```ts
-import { NgModule } from '@angular/core';
-import { CommonModule } from '@angular/common';
-import { FormsModule } from '@angular/forms';
-
-import { IonicModule } from '@ionic/angular';
-
-import { GeoCatalogTestPageRoutingModule } from './geo-catalog-test-routing.module';
-import { GeoCatalogTestPage } from './geo-catalog-test.page';
-
-@NgModule({
-  imports: [CommonModule, FormsModule, IonicModule, GeoCatalogTestPageRoutingModule],
-  declarations: [GeoCatalogTestPage],
-})
-export class GeoCatalogTestPageModule {}
-```
-
-## `frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.page.ts`
-
-What this code does:
-
-- triggers `runGeoTest()`
-- shows loading state
-- renders categories from API response
-
-This is only a validation page.
-
-```ts
-import { Component } from '@angular/core';
-import { GeoCatalogService } from '../../lib/services/geo-catalog.service';
-
-@Component({
-  selector: 'app-geo-catalog-test',
-  templateUrl: './geo-catalog-test.page.html',
-  styleUrls: ['./geo-catalog-test.page.scss'],
-  standalone: false,
-})
-export class GeoCatalogTestPage {
-  loading = false;
-  categories: any[] = [];
-  errorMessage = '';
-
-  constructor(private geoCatalogService: GeoCatalogService) {}
-
-  runGeoTest() {
-    this.loading = true;
-    this.errorMessage = '';
-
-    this.geoCatalogService.runGeoTest().subscribe({
-      next: (response) => {
-        this.categories = response?.categories || [];
-        this.loading = false;
-      },
-      error: (error) => {
-        this.errorMessage = error?.error?.message || 'Failed to load geo catalog';
-        this.loading = false;
-      },
-    });
-  }
-}
-```
-
-## `frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.page.html`
-
-What this code does:
-
-- renders category headings
-- renders product names and counts
-- keeps validation simple for Phase 1
-
-```html
-<ion-header>
-  <ion-toolbar color="success">
-    <ion-title>Geo Catalog Test</ion-title>
-  </ion-toolbar>
-</ion-header>
-
-<ion-content class="ion-padding">
-  <ion-button expand="block" color="success" (click)="runGeoTest()" [disabled]="loading">
-    {{ loading ? 'Running...' : 'Run Pincode 560100 Test' }}
-  </ion-button>
-
-  <ion-text color="danger" *ngIf="errorMessage">
-    <p>{{ errorMessage }}</p>
-  </ion-text>
-
-  <ion-list *ngIf="categories.length">
-    <ion-item-group *ngFor="let category of categories">
-      <ion-item-divider color="light">
-        <ion-label>{{ category.name }}</ion-label>
-      </ion-item-divider>
-
-      <ion-item *ngFor="let product of category.products">
-        <ion-label>
-          <h3>{{ product.name }}</h3>
-          <p>Count: {{ product.count }}</p>
-        </ion-label>
-      </ion-item>
-    </ion-item-group>
-  </ion-list>
-</ion-content>
-```
-
-## `frontend/hha_web/src/app/pages/geo-catalog-test/geo-catalog-test.page.scss`
-
-What this code does:
-
-- minor display cleanup
-
-```scss
-ion-item-divider {
-  text-transform: capitalize;
-}
-```
-
-## `frontend/hha_web/src/app/app-routing.module.ts`
-
-What this code does:
-
-- adds test route:
-  - `/geo-catalog-test`
-
-Add this route:
+- Route: `/geo-catalog-test`
+- Already configured in `app-routing.module.ts`:
 
 ```ts
 {
@@ -2565,36 +2129,42 @@ Add this route:
 }
 ```
 
-## Run
+---
 
-```bash
-cd backend/catalogue_mgmt_service
-npm install
-npm run lcl
-```
+## New Files Summary
 
-```http
-POST http://localhost:2210/cms/apis/geo/test/pincode
-Content-Type: application/json
+| File | Action | Phase |
+|------|--------|-------|
+| `src/apis/utils/normalizeProduct.js` | Edit | 1 |
+| `src/apis/models/mongoCatalog/geoCatalogSchema.js` | Edit | 1 |
+| `src/apis/services/v1/catalogueMatcher.service.js` | **CREATE** | 1 |
+| `src/apis/services/v1/ai.service.js` | Edit | 1+2 |
+| `src/apis/services/v1/shopGeo.service.js` | Create | 1 |
+| `src/apis/services/v1/pincodeCatalogBuilder.service.js` | Create | 1 |
+| `src/apis/services/v1/geoHierarchy.service.js` | Create | 2 |
+| `src/apis/controllers/v1/geo.js` | Create | 1+2 |
+| `src/apis/routes/v1/geo.js` | Create | 1+2 |
+| `src/apis/routes/v1/index.js` | Edit (add geo route) | 1 |
+| `src/jobs/geoCatalog.job.js` | **CREATE** | 2 |
+| `src/InitApp/index.js` | Edit (add cron startup) | 2 |
+| `.lcl.env` | Edit (add Gemini + cron vars) | 2 |
 
-{
-  "pincode": "560100"
-}
-```
+---
 
-## Quick Postman URLs
+## Error Handling Summary
 
-Phase 1:
-
-```txt
-POST http://localhost:2210/cms/apis/geo/test/shop
-POST http://localhost:2210/cms/apis/geo/test/pincode
-```
-
-Phase 2:
-
-```txt
-POST http://localhost:2210/cms/apis/geo/apply
-GET  http://localhost:2210/cms/apis/geo/catalog?pincode=560100
-GET  http://localhost:2210/cms/apis/geo/catalog?shopId=1234
-```
+| Layer | Error | Handling |
+|-------|-------|----------|
+| Shop lookup | Remote API timeout | Falls back to local MongoDB collections |
+| Shop lookup | No shops found for pincode | Uses fallback categories |
+| Retailer query | MongoDB query error | Logs error, uses fallback categories |
+| Catalogue matching | Postgres query fails for chunk | Skips that chunk, continues with others |
+| Catalogue matching | No matches found | Returns empty categories (valid response) |
+| Gemini API | SDK not installed | Auto-falls back to static list |
+| Gemini API | API key missing | Auto-falls back to static list |
+| Gemini API | Rate limit / timeout | Falls back to static list for that category |
+| Gemini API | Invalid JSON response | Falls back to static list for that category |
+| Cron job | One pincode fails | Logs error, continues to next pincode |
+| Cron job | Already running | Skips second invocation (guard flag) |
+| Cron job | Hierarchy rebuild fails | Logs error, pincode data still saved |
+| Controller | Any unhandled error | Returns `500` with JSON error message |
