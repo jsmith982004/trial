@@ -719,7 +719,7 @@ Key flow:
 3. Extract product names and categories, count frequency
 4. For each category: get Gemini/fallback suggestions
 5. Merge DB products + AI products
-6. **Match entire merged list against master catalogue (Postgres)**
+6. **Match entire merged list against master catalogue (MongoDB)**
 7. **Keep only matched products**
 8. Store result in `geo_catalogs`
 9. Return catalogue-matched products
