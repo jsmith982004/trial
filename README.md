@@ -252,104 +252,97 @@ Why this exists:
 
 ```js
 const { Logger: log } = require('sarvm-utility');
-const Product = require('../../models/product');
+const MongoProduct = require('../../models/mongoCatalog/productSchema');
 
 /**
- * Match an array of product names against the master catalogue (Postgres product table).
- * Returns only products that have an exact or close match in the catalogue.
+ * Normalize string for matching
+ */
+const normalize = (str = '') =>
+  String(str).trim().toLowerCase();
+
+/**
+ * Match product names against MongoDB product collection
  *
- * @param {string[]} productNames - Array of product name strings to match
- * @returns {Promise<Map<string, { id: string, name: string }>>} Map of lowercase name -> catalogue product
+ * @param {string[]} productNames
+ * @returns {Promise<Map<string, { id: string, name: string }>>}
  */
 const matchAgainstCatalogue = async (productNames = []) => {
-  if (!productNames.length) {
-    return new Map();
-  }
+  if (!productNames.length) return new Map();
 
   const matchedMap = new Map();
 
   try {
-    // Dedupe and normalize for lookup
-    const uniqueNames = [...new Set(productNames.map((n) => String(n).trim()).filter(Boolean))];
+    // Step 1: Normalize & dedupe input
+    const uniqueNames = [
+      ...new Set(productNames.map((n) => normalize(n)).filter(Boolean)),
+    ];
 
-    // Batch query: find all products whose name matches any of the given names (case-insensitive)
-    // We use chunks to avoid overly large queries
-    const CHUNK_SIZE = 100;
-    const allMatched = [];
+    // Step 2: Build regex queries (partial match)
+    const regexQueries = uniqueNames.map((name) => ({
+      prdNm: { $regex: name, $options: 'i' },
+    }));
 
-    for (let i = 0; i < uniqueNames.length; i += CHUNK_SIZE) {
-      const chunk = uniqueNames.slice(i, i + CHUNK_SIZE);
+    // Step 3: Query MongoDB once
+    const results = await MongoProduct.find({
+      $or: regexQueries,
+    })
+      .select('_id prdNm')
+      .lean()
+      .exec();
 
-      try {
-        const results = await Product.query()
-          .select('id', 'name', 'dummyKey', 'image', 'status')
-          .where('status', '=', 'ACTIVE')
-          .where((builder) => {
-            chunk.forEach((productName) => {
-              builder.orWhere('name', 'ilike', productName);
-            });
-          });
+    // Step 4: Build map
+    results.forEach((product) => {
+      const key = normalize(product.prdNm);
 
-        allMatched.push(...results);
-      } catch (queryError) {
-        log.warn({
-          warn: 'CatalogueMatcher: chunk query failed',
-          error: queryError.message,
-          chunkSize: chunk.length,
-        });
-        // Continue with next chunk, don't fail entire operation
-      }
-    }
-
-    // Build lookup map: lowercase name -> catalogue product
-    allMatched.forEach((product) => {
-      const key = String(product.name).trim().toLowerCase();
       if (!matchedMap.has(key)) {
         matchedMap.set(key, {
-          id: product.id,
-          name: product.name,
-          dummyKey: product.dummyKey || null,
-          image: product.image || null,
+          id: product._id,
+          name: product.prdNm,
         });
       }
     });
 
     log.info({
-      info: 'CatalogueMatcher: matching complete',
+      info: 'Mongo CatalogueMatcher complete',
       inputCount: uniqueNames.length,
       matchedCount: matchedMap.size,
     });
   } catch (error) {
     log.error({
-      error: 'CatalogueMatcher: matching failed',
+      error: 'Mongo CatalogueMatcher failed',
       details: error.message,
     });
-    // Return empty map on failure — caller handles gracefully
   }
 
   return matchedMap;
 };
 
 /**
- * Filter a category's products to only include those found in the catalogue.
- *
- * @param {Array<{name: string, count: number, source: string}>} products
- * @param {Map<string, {id: string, name: string}>} catalogueMap
- * @returns {Array<{name: string, count: number, source: string, catalogueProductId: string}>}
+ * Filter products using matched catalogue map
  */
 const filterByCatalogue = (products = [], catalogueMap) => {
   return products
     .map((product) => {
-      const key = String(product.name).trim().toLowerCase();
-      const matched = catalogueMap.get(key);
+      const normalizedName = normalize(product.name);
 
-      if (!matched) {
-        return null; // Not in catalogue — exclude from output
+      // Find closest match (partial)
+      let matched = null;
+
+      for (const [key, value] of catalogueMap.entries()) {
+        if (
+          key.includes(normalizedName) ||
+          normalizedName.includes(key)
+        ) {
+          matched = value;
+          break;
+        }
       }
+
+      if (!matched) return null;
 
       return {
         ...product,
-        name: matched.name, // Use the exact catalogue name (proper casing)
+        name: matched.name, // use Mongo product name
         catalogueProductId: matched.id,
       };
     })
