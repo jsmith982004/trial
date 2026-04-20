@@ -1491,19 +1491,18 @@ const shopGeoService = require('../apis/services/v1/shopGeo.service');
 const { buildPincodeCatalog } = require('../apis/services/v1/pincodeCatalogBuilder.service');
 const { rebuildHierarchyCatalogs } = require('../apis/services/v1/geoHierarchy.service');
 
+// ✅ NEW: Import GeoCatalog model to read existing pincodes
+const GeoCatalog = require('../apis/models/mongoCatalog/geoCatalogSchema');
+
 let isStarted = false;
 let isRunning = false;
 
-// Delay helper to avoid overloading APIs
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Configurable delay between pincode builds (ms)
 const PINCODE_DELAY_MS = parseInt(process.env.GEO_CRON_PINCODE_DELAY_MS || '2000', 10);
 
 /**
- * Run the full geo catalog job once.
- * Processes ONE pincode at a time (sequential, not parallel).
- * Each pincode may call Gemini API, so we space them out.
+ * Run the geo catalog job once
  */
 const runGeoCatalogJobOnce = async () => {
   if (isRunning) {
@@ -1517,64 +1516,99 @@ const runGeoCatalogJobOnce = async () => {
   try {
     log.info({ info: 'Geo catalog job started' });
 
+    // Step 1: Get all shop locations
     const shopLocations = await shopGeoService.getAllShopLocations();
-    const pincodes = [...new Set(shopLocations.map((shop) => shop?.pincode).filter(Boolean))];
 
-    log.info({ info: `Geo catalog job: processing ${pincodes.length} pincodes sequentially` });
+    // Step 2: Extract all pincodes from shops
+    const allPincodes = [
+      ...new Set(
+        shopLocations
+          .map((shop) => shop?.pincode)
+          .filter(Boolean)
+      ),
+    ];
+
+    // ✅ NEW: Fetch already processed pincodes from geo_catalogs
+    const existingCatalogs = await GeoCatalog.find({ level: 'PINCODE' })
+      .select('pincode')
+      .lean();
+
+    // ✅ NEW: Convert existing pincodes into a Set for fast lookup
+    const existingPincodeSet = new Set(
+      existingCatalogs.map((doc) => String(doc.pincode))
+    );
+
+    // ✅ NEW: Filter only NEW pincodes (not already processed)
+    const newPincodes = allPincodes.filter(
+      (pincode) => !existingPincodeSet.has(String(pincode))
+    );
+
+    log.info({
+      info: `Geo catalog job: total pincodes = ${allPincodes.length}, new pincodes = ${newPincodes.length}`,
+    });
 
     let successCount = 0;
     let failCount = 0;
 
-    // Process ONE pincode at a time
-    for (let i = 0; i < pincodes.length; i++) {
-      const pincode = pincodes[i];
+    // ✅ CHANGED: Loop ONLY through new pincodes instead of all
+    for (let i = 0; i < newPincodes.length; i++) {
+      const pincode = newPincodes[i];
 
       try {
-        log.info({ info: `Geo catalog job: processing pincode ${pincode} (${i + 1}/${pincodes.length})` });
+        log.info({
+          info: `Processing NEW pincode ${pincode} (${i + 1}/${newPincodes.length})`,
+        });
+
         await buildPincodeCatalog(pincode);
         successCount++;
       } catch (error) {
         failCount++;
         log.error({
-          error: `Geo catalog job: failed for pincode ${pincode}`,
+          error: `Failed for pincode ${pincode}`,
           details: error.message,
         });
-        // Continue to next pincode — don't stop the whole job
       }
 
-      // Delay between pincodes to avoid API rate limits
-      if (i < pincodes.length - 1) {
+      // Delay to avoid overloading system / Gemini API
+      if (i < newPincodes.length - 1) {
         await delay(PINCODE_DELAY_MS);
       }
     }
 
-    // Rebuild hierarchy after all pincodes are processed
+    // Rebuild hierarchy after processing
     try {
       await rebuildHierarchyCatalogs();
       log.info({ info: 'Geo catalog job: hierarchy rebuild complete' });
     } catch (error) {
-      log.error({ error: 'Geo catalog job: hierarchy rebuild failed', details: error.message });
+      log.error({
+        error: 'Hierarchy rebuild failed',
+        details: error.message,
+      });
     }
 
     const durationSeconds = Math.round((Date.now() - startTime) / 1000);
 
     log.info({
       info: 'Geo catalog job completed',
-      pincodesProcessed: pincodes.length,
+      totalPincodes: allPincodes.length,
+      newPincodes: newPincodes.length,
       successCount,
       failCount,
       durationSeconds,
     });
   } catch (error) {
-    log.error({ error: 'Geo catalog job fatal error', details: error.message, stack: error.stack });
+    log.error({
+      error: 'Geo catalog job fatal error',
+      details: error.message,
+      stack: error.stack,
+    });
   } finally {
     isRunning = false;
   }
 };
 
 /**
- * Schedule the nightly cron job.
- * Runs at 2:00 AM IST every day.
+ * Schedule cron at 2 AM IST
  */
 const startGeoCatalogJob = () => {
   if (isStarted) return;
@@ -1585,13 +1619,16 @@ const startGeoCatalogJob = () => {
       try {
         await runGeoCatalogJobOnce();
       } catch (error) {
-        log.error({ error: 'Geo catalog cron failed', details: error.message });
+        log.error({
+          error: 'Geo catalog cron failed',
+          details: error.message,
+        });
       }
     },
     {
       scheduled: true,
       timezone: 'Asia/Kolkata',
-    },
+    }
   );
 
   isStarted = true;
