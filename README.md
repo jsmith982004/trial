@@ -564,131 +564,159 @@ What this code does:
 
 ```js
 const axios = require('axios');
-const mongoose = require('mongoose');
 const { Logger: log } = require('sarvm-utility');
 
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
-const { loadBalancer, system_token } = require('@config');
 
-const chunkArray = (items = [], size = 100) => {
-  const chunks = [];
-  for (let index = 0; index < items.length; index += size) {
-    chunks.push(items.slice(index, index + size));
-  }
-  return chunks;
-};
+/**
+ * In-memory cache to avoid repeated HTTP calls
+ * Key: profile URL
+ * Value: pincode
+ */
+const pincodeCache = new Map();
 
-const normalizeRecord = (record = {}) => {
-  const shopId = Number(record.shopId || record.shop_id || record.id);
-  if (!shopId) return null;
+/**
+ * Normalize shop record
+ */
+const normalizeShop = (shop) => {
+  if (!shop?.shopId) return null;
 
   return {
-    shopId,
-    pincode: record.pincode ? String(record.pincode) : null,
-    city: record.city || record.locality || null,
-    state: record.state || record.region || null,
-    country: record.country || 'India',
-    locality: record.locality || null,
-    latitude: record.latitude || record.lat || record.location?.latitude || null,
-    longitude: record.longitude || record.lon || record.location?.longitude || null,
+    shopId: Number(shop.shopId),
+    url: shop.url || null,
   };
 };
 
-const fetchFromRemote = async (shopIds = []) => {
-  if (!shopIds.length || !loadBalancer) return [];
+/**
+ * Fetch pincode from profile.json URL
+ */
+const getPincodeFromProfile = async (url) => {
+  if (!url) return null;
+
+  // Cache hit
+  if (pincodeCache.has(url)) {
+    return pincodeCache.get(url);
+  }
 
   try {
-    const response = await axios({
-      method: 'get',
-      url: `${loadBalancer}/rms/apis/v2/shop/getPGShopDetails/${shopIds.join(',')}`,
-      timeout: 4000,
-      headers: { Authorization: `Bearer ${system_token}` },
+    const response = await axios.get(url, {
+      timeout: 3000,
     });
-    return (response?.data?.data || []).map(normalizeRecord).filter(Boolean);
+
+    const data = response?.data || {};
+
+    const pincode =
+      data?.shop?.location?.pincode ||
+      data?.vendor?.pincode ||
+      null;
+
+    // Store in cache (even null to prevent retry spam)
+    pincodeCache.set(url, pincode);
+
+    return pincode;
   } catch (error) {
-    log.warn({ warn: 'Geo shop remote lookup failed', error: error.message });
-    return [];
+    log.warn({
+      warn: 'shopGeo: failed to fetch profile',
+      url,
+      error: error.message,
+    });
+
+    pincodeCache.set(url, null);
+    return null;
   }
 };
 
-const fetchFromLocalCollections = async (shopIds = []) => {
-  if (!shopIds.length || !mongoose.connection?.db) return [];
-
-  const candidateCollections = ['shops', 'shopdetails', 'shopdetail', 'shop_meta', 'shopmeta', 'shopmetadata'];
-
-  try {
-    const existingCollections = await mongoose.connection.db.listCollections().toArray();
-    const collectionNames = new Set(existingCollections.map((c) => c.name));
-    const records = [];
-
-    for (const collectionName of candidateCollections) {
-      if (!collectionNames.has(collectionName)) continue;
-
-      const collection = mongoose.connection.db.collection(collectionName);
-      const docs = await collection
-        .find({ $or: [{ shopId: { $in: shopIds } }, { shop_id: { $in: shopIds } }] })
-        .toArray();
-
-      docs.forEach((doc) => {
-        const normalized = normalizeRecord(doc);
-        if (normalized) records.push(normalized);
-      });
-    }
-    return records;
-  } catch (error) {
-    log.warn({ warn: 'Geo shop local collection lookup failed', error: error.message });
-    return [];
-  }
-};
-
-const dedupeByShopId = (records = []) => {
-  const map = new Map();
-  records.forEach((record) => {
-    if (!record?.shopId || map.has(record.shopId)) return;
-    map.set(record.shopId, record);
-  });
-  return Array.from(map.values());
-};
-
-const getShopLocations = async (shopIds = []) => {
-  const normalizedIds = [...new Set(shopIds.map((id) => Number(id)).filter(Boolean))];
-  const allRecords = [];
-
-  for (const chunk of chunkArray(normalizedIds)) {
-    const remoteRecords = await fetchFromRemote(chunk);
-    const missingIds = chunk.filter(
-      (id) => !remoteRecords.some((r) => Number(r.shopId) === Number(id)),
-    );
-    const localRecords = missingIds.length ? await fetchFromLocalCollections(missingIds) : [];
-    allRecords.push(...remoteRecords, ...localRecords);
-  }
-
-  return dedupeByShopId(allRecords);
-};
-
+/**
+ * Get all unique shop IDs from retailer catalog
+ */
 const getAllRetailerShopIds = async () => {
-  const shopIds = await RetailerCatalog.distinct('shopId', { shopId: { $ne: null } });
+  const shopIds = await RetailerCatalog.distinct('shopId', {
+    shopId: { $ne: null },
+  });
+
   return shopIds.map((id) => Number(id)).filter(Boolean);
 };
 
-const getAllShopLocations = async () => getShopLocations(await getAllRetailerShopIds());
+/**
+ * Get all shop records (shopId + url)
+ */
+const getAllShops = async () => {
+  const docs = await RetailerCatalog.find(
+    { shopId: { $ne: null }, url: { $ne: null } },
+    { shopId: 1, url: 1 }
+  ).lean();
 
-const getShopsByPincode = async (pincode) => {
-  const records = await getAllShopLocations();
-  return records.filter((r) => String(r.pincode) === String(pincode));
+  const map = new Map();
+
+  docs.forEach((doc) => {
+    const normalized = normalizeShop(doc);
+    if (!normalized) return;
+
+    if (!map.has(normalized.shopId)) {
+      map.set(normalized.shopId, normalized);
+    }
+  });
+
+  return Array.from(map.values());
 };
 
+/**
+ * Get all shop locations (pincode resolved via profile URL)
+ */
+const getAllShopLocations = async () => {
+  const shops = await getAllShops();
+
+  const results = [];
+
+  // Sequential processing (safe for Phase 1)
+  for (const shop of shops) {
+    const pincode = await getPincodeFromProfile(shop.url);
+
+    results.push({
+      shopId: shop.shopId,
+      pincode: pincode ? String(pincode) : null,
+    });
+  }
+
+  return results;
+};
+
+/**
+ * Get shops filtered by pincode
+ */
+const getShopsByPincode = async (targetPincode) => {
+  const normalized = String(targetPincode);
+
+  const allShops = await getAllShopLocations();
+
+  return allShops.filter(
+    (shop) => String(shop.pincode) === normalized
+  );
+};
+
+/**
+ * Get single shop location
+ */
 const getShopLocation = async (shopId) => {
-  const [record] = await getShopLocations([shopId]);
-  return record || null;
+  const shops = await getAllShops();
+
+  const shop = shops.find((s) => Number(s.shopId) === Number(shopId));
+
+  if (!shop) return null;
+
+  const pincode = await getPincodeFromProfile(shop.url);
+
+  return {
+    shopId: shop.shopId,
+    pincode: pincode ? String(pincode) : null,
+  };
 };
 
 module.exports = {
   getAllRetailerShopIds,
   getAllShopLocations,
-  getShopLocations,
-  getShopLocation,
   getShopsByPincode,
+  getShopLocation,
 };
 ```
 
