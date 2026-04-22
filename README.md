@@ -747,143 +747,131 @@ Key flow:
 9. Return catalogue-matched products
 
 ```js
-const { Types } = require('mongoose');
 const { Logger: log } = require('sarvm-utility');
 
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
 const GeoCatalog = require('../../models/mongoCatalog/geoCatalogSchema');
-const MongoProduct = require('../../models/mongoCatalog/productSchema');
-const MongoCategory = require('../../models/mongoCatalog/categorySchema');
 const exactProductName = require('../../utils/normalizeProduct');
+
 const aiService = require('./ai.service');
 const shopGeoService = require('./shopGeo.service');
-const { matchAgainstCatalogue, filterByCatalogue } = require('./catalogueMatcher.service');
 
-const TOP_PRODUCTS_LIMIT = parseInt(process.env.TOP_PRODUCTS_LIMIT || '10', 10);
-const GEMINI_BASE_SCORE = 25;
+const TOP_PRODUCTS_LIMIT = 15;
 
 /* ---------------- HELPERS ---------------- */
 
-const getCategoryName = (retailerDoc, productDoc) => {
-  const catalog = retailerDoc?.catalog || {};
-  const rawCategory =
-    retailerDoc?.category ||
-    catalog?.category ||
-    catalog?.catPnm ||
-    productDoc?.catPnm ||
+const normalizeCategory = (str = '') =>
+  String(str)
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .trim();
+
+const normalizeName = (str = '') =>
+  String(str).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+const getCategoryName = (doc) => {
+  const raw =
+    doc?.category ||
+    doc?.catalog?.catPnm ||
     '';
 
-  const firstSegment = Array.isArray(rawCategory)
-    ? rawCategory[0]
-    : String(rawCategory).split('/')[0];
+  const first = String(raw).split('/')[0];
 
-  return String(firstSegment || '')
-    .replace(/[_-]+/g, ' ')
-    .trim()
-    .toLowerCase();
+  return normalizeCategory(first);
 };
 
-/* ---------------- AI MERGE ---------------- */
+/* ---------------- STEP 1: BUILD DB PRODUCTS ---------------- */
 
-const mergeAIProductsIntoCategories = async (categories = []) => {
-  const mergedCategories = [];
+const buildRetailerCategories = (retailerDocs = []) => {
+  const categoryMap = {};
 
-  for (const category of categories) {
-    const dbProducts = category.products || [];
-    const dbNames = new Set(dbProducts.map((p) => p.name.toLowerCase()));
+  retailerDocs.forEach((doc) => {
+    const name = exactProductName(doc?.catalog?.prdNm || '');
+    const category = getCategoryName(doc);
 
-    let suggestedProducts = [];
-    try {
-      suggestedProducts = await aiService.getGeminiCategoryProducts(
-        category.name,
-        dbProducts.map((p) => p.name)
-      );
-    } catch {
-      const fallback = aiService.getFallbackProducts([category.name]);
-      suggestedProducts = fallback[category.name] || [];
+    if (!name || !category) return;
+
+    if (!categoryMap[category]) {
+      categoryMap[category] = {};
     }
 
-    const aiProducts = suggestedProducts
-      .map(exactProductName)
-      .filter(Boolean)
-      .filter((n) => !dbNames.has(n.toLowerCase()))
-      .slice(0, TOP_PRODUCTS_LIMIT)
-      .map((name, index) => ({
-        name,
-        count: Math.max(1, GEMINI_BASE_SCORE - index * 5),
-        source: 'AI',
-      }));
+    categoryMap[category][name] =
+      (categoryMap[category][name] || 0) + 1;
+  });
 
-    mergedCategories.push({
-      ...category,
-      products: [...dbProducts, ...aiProducts],
-    });
-  }
-
-  return mergedCategories;
-};
-
-/* ---------------- MATCHING ---------------- */
-
-const applyCatalogueMatching = async (categories = []) => {
-  const allNames = [];
-  categories.forEach((c) => c.products.forEach((p) => allNames.push(p.name)));
-
-  const map = await matchAgainstCatalogue(allNames);
-
-  return categories.map((cat) => ({
-    ...cat,
-    products: filterByCatalogue(cat.products, map), // NO SLICE
+  return Object.entries(categoryMap).map(([name, products]) => ({
+    name,
+    products: Object.entries(products)
+      .map(([n, c]) => ({
+        name: n,
+        count: c,
+        source: 'DB',
+      }))
+      .sort((a, b) => b.count - a.count),
   }));
 };
 
-/* ---------------- NEW MERGE LOGIC ---------------- */
+/* ---------------- STEP 2: MERGE DB + AI ---------------- */
 
-const mergeFinalCategories = (retailerCategories = [], topCategories = []) => {
-  const categoryMap = new Map();
+const buildTopProducts = async (categories = []) => {
+  const fallback = aiService.getFallbackProducts();
 
-  retailerCategories.forEach((cat) => {
-    categoryMap.set(cat.name, { retailer: cat.products || [], top: [] });
-  });
+  const finalCategories = [];
 
-  topCategories.forEach((cat) => {
-    if (!categoryMap.has(cat.name)) {
-      categoryMap.set(cat.name, { retailer: [], top: cat.products || [] });
-    } else {
-      categoryMap.get(cat.name).top = cat.products || [];
+  for (const category of categories) {
+    const dbProducts = category.products || [];
+
+    const key = normalizeCategory(category.name);
+
+    // ✅ Only apply AI if category exists in fallback
+    const aiProducts = fallback[key] || [];
+
+    const finalList = [];
+    const usedNames = new Set();
+
+    // 1. Add DB products first
+    for (const p of dbProducts) {
+      const clean = exactProductName(p.name);
+      const norm = normalizeName(clean);
+
+      if (!usedNames.has(norm)) {
+        finalList.push({
+          name: clean,
+          count: p.count,
+          source: 'DB',
+        });
+        usedNames.add(norm);
+      }
+
+      if (finalList.length >= TOP_PRODUCTS_LIMIT) break;
     }
-  });
 
-  const final = [];
+    // 2. Fill remaining with AI
+    if (finalList.length < TOP_PRODUCTS_LIMIT) {
+      for (const name of aiProducts) {
+        const clean = exactProductName(name);
+        const norm = normalizeName(clean);
 
-  categoryMap.forEach((value, name) => {
-    const rMap = new Map(value.retailer.map((p) => [p.catalogueProductId, p]));
-    const tMap = new Map(value.top.map((p) => [p.catalogueProductId, p]));
+        if (!usedNames.has(norm)) {
+          finalList.push({
+            name: clean,
+            count: 0,
+            source: 'AI',
+          });
+          usedNames.add(norm);
+        }
 
-    const common = [];
-    const retailerOnly = [];
-    const topOnly = [];
-
-    rMap.forEach((p, id) => {
-      if (tMap.has(id)) common.push(p);
-      else retailerOnly.push(p);
-    });
-
-    tMap.forEach((p, id) => {
-      if (!rMap.has(id)) topOnly.push(p);
-    });
-
-    const products = [...common, ...retailerOnly, ...topOnly].slice(
-      0,
-      TOP_PRODUCTS_LIMIT * 2
-    );
-
-    if (products.length) {
-      final.push({ name, products });
+        if (finalList.length >= TOP_PRODUCTS_LIMIT) break;
+      }
     }
-  });
 
-  return final;
+    finalCategories.push({
+      name: category.name,
+      products: finalList,
+    });
+  }
+
+  return finalCategories;
 };
 
 /* ---------------- MAIN BUILDER ---------------- */
@@ -891,54 +879,27 @@ const mergeFinalCategories = (retailerCategories = [], topCategories = []) => {
 const buildPincodeCatalog = async (pincode) => {
   const normalizedPincode = String(pincode);
 
-  let shops = await shopGeoService.getShopsByPincode(normalizedPincode);
+  const shops = await shopGeoService.getShopsByPincode(normalizedPincode);
   const shopIds = shops.map((s) => Number(s.shopId)).filter(Boolean);
 
   let categories = [];
-  let buildStatus = 'SUCCESS';
 
   if (shopIds.length) {
-    const retailerProducts = await RetailerCatalog.find({
+    const retailerDocs = await RetailerCatalog.find({
       shopId: { $in: shopIds },
       catalog: { $ne: null },
     }).lean();
 
-    const categoryProductCounts = {};
+    // STEP 1: DB products
+    const retailerCategories = buildRetailerCategories(retailerDocs);
 
-    retailerProducts.forEach((doc) => {
-      const name = exactProductName(doc?.catalog?.prdNm || '');
-      const category = getCategoryName(doc, null);
-
-      if (!name || !category) return;
-
-      categoryProductCounts[category] = categoryProductCounts[category] || {};
-      categoryProductCounts[category][name] =
-        (categoryProductCounts[category][name] || 0) + 1;
-    });
-
-    const retailerCategories = Object.entries(categoryProductCounts).map(
-      ([name, products]) => ({
-        name,
-        products: Object.entries(products).map(([n, c]) => ({
-          name: n,
-          count: c,
-          source: 'DB',
-        })),
-      })
-    );
-
-    let topCategories = await mergeAIProductsIntoCategories(
-      JSON.parse(JSON.stringify(retailerCategories))
-    );
-
-    const matchedRetailer = await applyCatalogueMatching(retailerCategories);
-    const matchedTop = await applyCatalogueMatching(topCategories);
-
-    categories = mergeFinalCategories(matchedRetailer, matchedTop);
+    // STEP 2: Merge DB + AI
+    categories = await buildTopProducts(retailerCategories);
   }
 
   categories = categories.filter((c) => c.products.length);
 
+  // STEP 3: Save
   const document = await GeoCatalog.findOneAndUpdate(
     { level: 'PINCODE', pincode: normalizedPincode },
     {
@@ -947,7 +908,7 @@ const buildPincodeCatalog = async (pincode) => {
         pincode: normalizedPincode,
         categories,
         lastBuildAt: new Date(),
-        buildStatus,
+        buildStatus: 'SUCCESS',
       },
     },
     { upsert: true, new: true }
@@ -959,7 +920,9 @@ const buildPincodeCatalog = async (pincode) => {
   };
 };
 
-module.exports = { buildPincodeCatalog };
+module.exports = {
+  buildPincodeCatalog,
+};
 ```
 
 ---
