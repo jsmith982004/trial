@@ -1172,18 +1172,20 @@ const { buildPincodeCatalog } = require('../../services/v1/pincodeCatalogBuilder
 const {
   applyGeoCatalogToShop,
   getGeoCatalogWithFallback,
-  rebuildHierarchyCatalogs,
 } = require('../../services/v1/geoHierarchy.service');
 const shopGeoService = require('../../services/v1/shopGeo.service');
 
-// ─── Phase 1: Test pincode catalog ───────────────────────────────────
+/* ---------------- TEST PINCODE ---------------- */
 
-const testPincodeCatalog = async (req, res, next) => {
+const testPincodeCatalog = async (req, res) => {
   try {
     const { pincode } = req.body;
 
     if (!pincode) {
-      return res.status(400).json({ success: false, message: 'pincode is required in request body' });
+      return res.status(400).json({
+        success: false,
+        message: 'pincode is required',
+      });
     }
 
     const result = await buildPincodeCatalog(pincode);
@@ -1191,27 +1193,37 @@ const testPincodeCatalog = async (req, res, next) => {
     return res.status(200).json({
       success: true,
       pincode: String(pincode),
-      buildStatus: result.buildStatus,
-      usedFallback: result.usedFallback,
-      shopCount: result.shopCount,
       categoryCount: result.categories.length,
-      totalProducts: result.categories.reduce((c, cat) => c + (cat.products || []).length, 0),
+      totalProducts: result.categories.reduce(
+        (c, cat) => c + (cat.products || []).length,
+        0
+      ),
       categories: result.categories,
     });
   } catch (error) {
-    log.error({ error: 'Error in testPincodeCatalog', details: error.message, stack: error.stack });
-    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+    log.error({
+      error: 'Error in testPincodeCatalog',
+      details: error.message,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+    });
   }
 };
 
-// ─── Phase 1: Test shop catalog (resolves pincode from shopId) ───────
+/* ---------------- TEST SHOP ---------------- */
 
-const testShopCatalog = async (req, res, next) => {
+const testShopCatalog = async (req, res) => {
   try {
     const { shopId } = req.body;
 
     if (!shopId) {
-      return res.status(400).json({ success: false, message: 'shopId is required in request body' });
+      return res.status(400).json({
+        success: false,
+        message: 'shopId is required',
+      });
     }
 
     const location = await shopGeoService.getShopLocation(Number(shopId));
@@ -1219,7 +1231,7 @@ const testShopCatalog = async (req, res, next) => {
     if (!location?.pincode) {
       return res.status(404).json({
         success: false,
-        message: `Pincode not found for shopId ${shopId}. Shop may not have geo metadata.`,
+        message: 'Pincode not found for shop',
       });
     }
 
@@ -1229,46 +1241,72 @@ const testShopCatalog = async (req, res, next) => {
       success: true,
       shopId: Number(shopId),
       pincode: location.pincode,
-      city: location.city || null,
-      state: location.state || null,
-      buildStatus: result.buildStatus,
-      usedFallback: result.usedFallback,
-      shopCount: result.shopCount,
       categoryCount: result.categories.length,
-      totalProducts: result.categories.reduce((c, cat) => c + (cat.products || []).length, 0),
+      totalProducts: result.categories.reduce(
+        (c, cat) => c + (cat.products || []).length,
+        0
+      ),
       categories: result.categories,
     });
   } catch (error) {
-    log.error({ error: 'Error in testShopCatalog', details: error.message, stack: error.stack });
-    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+    log.error({
+      error: 'Error in testShopCatalog',
+      details: error.message,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+    });
   }
 };
 
-// ─── Phase 2: Apply geo catalog to a shop ────────────────────────────
+/* ---------------- APPLY GEO CATALOG ---------------- */
 
-const applyGeoCatalog = async (req, res, next) => {
+const applyGeoCatalog = async (req, res) => {
   try {
     const { shopId, pincode } = req.body;
 
     if (!shopId) {
-      return res.status(400).json({ success: false, message: 'shopId is required in request body' });
+      return res.status(400).json({
+        success: false,
+        message: 'shopId is required',
+      });
     }
 
-    const result = await applyGeoCatalogToShop({ shopId, pincode });
+    const result = await applyGeoCatalogToShop({
+      shopId,
+      pincode,
+    });
+
     return res.status(200).json(result);
   } catch (error) {
-    log.error({ error: 'Error in applyGeoCatalog', details: error.message, stack: error.stack });
-    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+    log.error({
+      error: 'Error in applyGeoCatalog',
+      details: error.message,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+    });
   }
 };
 
-// ─── Phase 2: Get resolved geo catalog (with fallback) ───────────────
+/* ---------------- GET GEO CATALOG (UPDATED) ---------------- */
 
-const getResolvedGeoCatalog = async (req, res, next) => {
+const getResolvedGeoCatalog = async (req, res) => {
   try {
     const { shopId, pincode } = req.query;
-    const location = shopId ? await shopGeoService.getShopLocation(Number(shopId)) : null;
+
+    // ✅ Resolve shop location if shopId present
+    const location = shopId
+      ? await shopGeoService.getShopLocation(Number(shopId))
+      : null;
+
+    // ✅ IMPORTANT: pass shopId into service
     const catalog = await getGeoCatalogWithFallback({
+      shopId: shopId ? Number(shopId) : null,
       pincode: pincode || location?.pincode,
       city: location?.city,
       state: location?.state,
@@ -1276,35 +1314,27 @@ const getResolvedGeoCatalog = async (req, res, next) => {
     });
 
     if (!catalog) {
-      return res.status(404).json({ success: false, message: 'No geo catalog found for given parameters' });
+      return res.status(404).json({
+        success: false,
+        message: 'No geo catalog found',
+      });
     }
 
-    return res.status(200).json({ success: true, catalog });
-  } catch (error) {
-    log.error({ error: 'Error in getResolvedGeoCatalog', details: error.message, stack: error.stack });
-    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
-  }
-};
-
-// ─── Phase 2: Manual cron trigger for testing ────────────────────────
-
-const triggerCronManually = async (req, res, next) => {
-  try {
-    const { runGeoCatalogJobOnce } = require('../.././../jobs/geoCatalog.job');
-
-    // Run asynchronously — respond immediately
-    res.status(202).json({
+    return res.status(200).json({
       success: true,
-      message: 'Geo catalog cron job triggered. Check server logs for progress.',
+      catalog,
+    });
+  } catch (error) {
+    log.error({
+      error: 'Error in getResolvedGeoCatalog',
+      details: error.message,
+      stack: error.stack,
     });
 
-    // Execute in background
-    runGeoCatalogJobOnce()
-      .then(() => log.info({ info: 'Manual cron trigger completed successfully' }))
-      .catch((error) => log.error({ error: 'Manual cron trigger failed', details: error.message }));
-  } catch (error) {
-    log.error({ error: 'Error triggering cron', details: error.message });
-    return res.status(500).json({ success: false, message: 'Internal server error', error: error.message });
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+    });
   }
 };
 
@@ -1313,7 +1343,6 @@ module.exports = {
   testShopCatalog,
   applyGeoCatalog,
   getResolvedGeoCatalog,
-  triggerCronManually,
 };
 ```
 
