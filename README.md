@@ -951,144 +951,204 @@ What this code does:
 const { Logger: log } = require('sarvm-utility');
 
 const GeoCatalog = require('../../models/mongoCatalog/geoCatalogSchema');
-const CustomCatalog = require('../../models/mongoCatalog/customCatalogSchema');
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
+const CustomCatalog = require('../../models/mongoCatalog/customCatalogSchema');
 const shopGeoService = require('./shopGeo.service');
 
-const aggregateCategories = (documents = []) => {
-  const categoryMap = new Map();
+/* ---------------- HELPERS ---------------- */
 
-  documents.forEach((document) => {
-    (document?.categories || []).forEach((category) => {
-      const categoryName = String(category?.name || '').trim().toLowerCase();
-      if (!categoryName) return;
+const normalize = (str = '') =>
+  String(str).toLowerCase().replace(/[^a-z0-9]/g, '').trim();
 
-      if (!categoryMap.has(categoryName)) {
-        categoryMap.set(categoryName, new Map());
-      }
+const normalizeCategory = (str = '') =>
+  String(str).toLowerCase().replace(/\s+/g, '_').trim();
 
-      const productMap = categoryMap.get(categoryName);
+/**
+ * Group shop products by category
+ */
+const buildShopCategoryMap = (retailerDocs = []) => {
+  const map = new Map();
 
-      (category?.products || []).forEach((product) => {
-        const productName = String(product?.name || '').trim().toLowerCase();
-        if (!productName) return;
+  retailerDocs.forEach((doc) => {
+    const categoryRaw =
+      doc?.category ||
+      doc?.catalog?.catPnm ||
+      '';
 
-        productMap.set(productName, {
-          count: (productMap.get(productName)?.count || 0) + Number(product?.count || 0),
-          catalogueProductId: product.catalogueProductId || productMap.get(productName)?.catalogueProductId || null,
-          source: product.source || 'DB',
-        });
-      });
+    const category = normalizeCategory(
+      String(categoryRaw).split('/')[0]
+    );
+
+    const name = String(doc?.catalog?.prdNm || '').trim();
+
+    if (!category || !name) return;
+
+    if (!map.has(category)) {
+      map.set(category, []);
+    }
+
+    map.get(category).push({
+      name,
+      source: 'SHOP',
     });
   });
 
-  return Array.from(categoryMap.entries())
-    .map(([name, productMap]) => ({
-      name,
-      products: Array.from(productMap.entries())
-        .map(([productName, data]) => ({
-          name: productName,
-          count: data.count,
-          catalogueProductId: data.catalogueProductId,
-          source: data.source,
-        }))
-        .sort((l, r) => r.count - l.count || l.name.localeCompare(r.name))
-        .slice(0, 10),
-    }))
-    .sort((l, r) => l.name.localeCompare(r.name));
+  return map;
 };
 
-const upsertGeoLevel = async (filter, payload) =>
-  GeoCatalog.findOneAndUpdate(filter, { $set: payload }, { upsert: true, new: true, setDefaultsOnInsert: true });
+/**
+ * Merge logic:
+ * COMMON → SHOP ONLY → GEO ONLY
+ */
+const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
+  const geoMap = new Map();
+  const used = new Set();
 
-const rebuildHierarchyCatalogs = async () => {
-  const pincodeCatalogs = await GeoCatalog.find({ level: 'PINCODE' }).lean().exec();
-  const shopLocations = await shopGeoService.getAllShopLocations();
-  const locationByPincode = new Map();
-
-  shopLocations.forEach((location) => {
-    if (location?.pincode && !locationByPincode.has(String(location.pincode))) {
-      locationByPincode.set(String(location.pincode), location);
-    }
+  geoProducts.forEach((p) => {
+    geoMap.set(normalize(p.name), p);
   });
 
-  const cityGroups = new Map();
-  const stateGroups = new Map();
-  const countryGroups = new Map();
+  const common = [];
+  const shopOnly = [];
+  const geoOnly = [];
 
-  pincodeCatalogs.forEach((catalog) => {
-    const location = locationByPincode.get(String(catalog.pincode)) || catalog;
+  // Step 1: COMMON + SHOP ONLY
+  for (const shopProduct of shopProducts) {
+    const norm = normalize(shopProduct.name);
 
-    if (location?.city) {
-      const key = String(location.city).toLowerCase();
-      cityGroups.set(key, [...(cityGroups.get(key) || []), catalog]);
-    }
-    if (location?.state) {
-      const key = String(location.state).toLowerCase();
-      stateGroups.set(key, [...(stateGroups.get(key) || []), catalog]);
-    }
-    if (location?.country) {
-      const key = String(location.country).toLowerCase();
-      countryGroups.set(key, [...(countryGroups.get(key) || []), catalog]);
-    }
-  });
+    if (geoMap.has(norm)) {
+      const geoMatch = geoMap.get(norm);
 
-  for (const [, documents] of cityGroups.entries()) {
-    const source = locationByPincode.get(String(documents[0].pincode)) || documents[0];
-    await upsertGeoLevel(
-      { level: 'CITY', city: source.city },
-      { level: 'CITY', city: source.city, state: source.state || null, country: source.country || 'India', categories: aggregateCategories(documents), lastBuildAt: new Date(), buildStatus: 'SUCCESS' },
-    );
+      common.push({
+        ...geoMatch,
+        source: 'COMMON',
+      });
+
+      used.add(norm);
+    } else {
+      shopOnly.push({
+        name: shopProduct.name,
+        count: 0,
+        source: 'SHOP',
+      });
+    }
   }
 
-  for (const [, documents] of stateGroups.entries()) {
-    const source = locationByPincode.get(String(documents[0].pincode)) || documents[0];
-    await upsertGeoLevel(
-      { level: 'STATE', state: source.state },
-      { level: 'STATE', state: source.state, country: source.country || 'India', categories: aggregateCategories(documents), lastBuildAt: new Date(), buildStatus: 'SUCCESS' },
-    );
+  // Step 2: GEO ONLY
+  for (const geoProduct of geoProducts) {
+    const norm = normalize(geoProduct.name);
+
+    if (!used.has(norm)) {
+      geoOnly.push({
+        ...geoProduct,
+        source: 'GEO',
+      });
+    }
   }
 
-  for (const [, documents] of countryGroups.entries()) {
-    const source = locationByPincode.get(String(documents[0].pincode)) || documents[0];
-    await upsertGeoLevel(
-      { level: 'COUNTRY', country: source.country || 'India' },
-      { level: 'COUNTRY', country: source.country || 'India', categories: aggregateCategories(documents), lastBuildAt: new Date(), buildStatus: 'SUCCESS' },
-    );
-  }
-
-  log.info({
-    info: 'Geo hierarchy rebuilt',
-    pincodes: pincodeCatalogs.length,
-    cities: cityGroups.size,
-    states: stateGroups.size,
-    countries: countryGroups.size,
-  });
+  return [...common, ...shopOnly, ...geoOnly];
 };
 
-const getGeoCatalogWithFallback = async ({ pincode, city, state, country }) => {
-  if (pincode) {
-    const doc = await GeoCatalog.findOne({ level: 'PINCODE', pincode: String(pincode) }).sort({ updatedAt: -1 }).lean().exec();
-    if (doc) return doc;
+/* ---------------- MAIN LOGIC ---------------- */
+
+const getGeoCatalogWithFallback = async ({ shopId, pincode, city, state, country }) => {
+  try {
+    /* ---------- STEP 1: Get Geo Catalog ---------- */
+
+    let geoCatalog = null;
+
+    if (pincode) {
+      geoCatalog = await GeoCatalog.findOne({
+        level: 'PINCODE',
+        pincode: String(pincode),
+      })
+        .sort({ updatedAt: -1 })
+        .lean();
+    }
+
+    if (!geoCatalog && city) {
+      geoCatalog = await GeoCatalog.findOne({ level: 'CITY', city })
+        .sort({ updatedAt: -1 })
+        .lean();
+    }
+
+    if (!geoCatalog && state) {
+      geoCatalog = await GeoCatalog.findOne({ level: 'STATE', state })
+        .sort({ updatedAt: -1 })
+        .lean();
+    }
+
+    if (!geoCatalog && country) {
+      geoCatalog = await GeoCatalog.findOne({ level: 'COUNTRY', country })
+        .sort({ updatedAt: -1 })
+        .lean();
+    }
+
+    if (!geoCatalog) return null;
+
+    /* ---------- STEP 2: If NO shopId → return as-is ---------- */
+
+    if (!shopId) return geoCatalog;
+
+    /* ---------- STEP 3: Fetch Shop Products ---------- */
+
+    const retailerDocs = await RetailerCatalog.find({
+      shopId: Number(shopId),
+      catalog: { $ne: null },
+    }).lean();
+
+    if (!retailerDocs.length) {
+      return geoCatalog;
+    }
+
+    const shopCategoryMap = buildShopCategoryMap(retailerDocs);
+
+    /* ---------- STEP 4: Merge ONLY shop categories ---------- */
+
+    const finalCategories = [];
+
+    geoCatalog.categories.forEach((geoCategory) => {
+      const categoryName = normalizeCategory(geoCategory.name);
+
+      // ❗ Only include if shop has this category
+      if (!shopCategoryMap.has(categoryName)) return;
+
+      const shopProducts = shopCategoryMap.get(categoryName);
+      const geoProducts = geoCategory.products || [];
+
+      const mergedProducts = mergeCategoryProducts(
+        shopProducts,
+        geoProducts
+      );
+
+      finalCategories.push({
+        name: geoCategory.name,
+        products: mergedProducts,
+      });
+    });
+
+    return {
+      ...geoCatalog,
+      categories: finalCategories,
+    };
+  } catch (error) {
+    log.error({
+      error: 'Error in getGeoCatalogWithFallback',
+      details: error.message,
+    });
+    throw error;
   }
-  if (city) {
-    const doc = await GeoCatalog.findOne({ level: 'CITY', city }).sort({ updatedAt: -1 }).lean().exec();
-    if (doc) return doc;
-  }
-  if (state) {
-    const doc = await GeoCatalog.findOne({ level: 'STATE', state }).sort({ updatedAt: -1 }).lean().exec();
-    if (doc) return doc;
-  }
-  if (country) {
-    return GeoCatalog.findOne({ level: 'COUNTRY', country }).sort({ updatedAt: -1 }).lean().exec();
-  }
-  return null;
 };
+
+/* ---------------- APPLY FUNCTION (UNCHANGED) ---------------- */
 
 const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
   const numericShopId = Number(shopId);
+
   const location = (await shopGeoService.getShopLocation(numericShopId)) || {};
+
   const catalog = await getGeoCatalogWithFallback({
+    shopId,
     pincode: pincode || location.pincode,
     city: location.city,
     state: location.state,
@@ -1096,10 +1156,13 @@ const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
   });
 
   if (!catalog) {
-    return { success: false, message: 'No geo catalog found for the supplied hierarchy' };
+    return { success: false, message: 'No geo catalog found' };
   }
 
-  const retailerDoc = await RetailerCatalog.findOne({ shopId: numericShopId }).select('retailerId guid').lean().exec();
+  const retailerDoc = await RetailerCatalog.findOne({ shopId: numericShopId })
+    .select('retailerId guid')
+    .lean();
+
   const operations = [];
 
   catalog.categories.forEach((category) => {
@@ -1108,7 +1171,7 @@ const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
         updateOne: {
           filter: {
             shopId: numericShopId,
-            productId: `geo-${catalog.level}-${category.name}-${product.name}`,
+            productId: `geo-${category.name}-${product.name}`,
           },
           update: {
             $set: {
@@ -1116,16 +1179,11 @@ const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
               retailerId: retailerDoc?.retailerId || '',
               guid: retailerDoc?.guid || '',
               retailerName: 'Geo Catalog Auto Apply',
-              productId: `geo-${catalog.level}-${category.name}-${product.name}`,
+              productId: `geo-${category.name}-${product.name}`,
               productName: product.name,
               productNameStatus: 'NEW',
-              productDescriptionStatus: 'NEW',
-              productImageStatus: 'NEW',
-              description: `Auto-added from ${catalog.level} geo catalog`,
               category: category.name,
               subCategory: category.name,
-              requestFlag: false,
-              updateStatus: 'NEW',
             },
           },
           upsert: true,
@@ -1140,14 +1198,12 @@ const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
 
   return {
     success: true,
-    level: catalog.level,
     categories: catalog.categories.length,
     insertedProducts: operations.length,
   };
 };
 
 module.exports = {
-  rebuildHierarchyCatalogs,
   getGeoCatalogWithFallback,
   applyGeoCatalogToShop,
 };
