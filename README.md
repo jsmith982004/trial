@@ -813,6 +813,9 @@ const buildRetailerCategories = (retailerDocs = []) => {
 
 /* ---------------- STEP 2: MERGE DB + AI ---------------- */
 
+const DB_LIMIT = 10;
+const AI_LIMIT = 10;
+
 const buildTopProducts = async (categories = []) => {
   const fallback = aiService.getFallbackProducts();
 
@@ -820,7 +823,6 @@ const buildTopProducts = async (categories = []) => {
 
   for (const category of categories) {
     const dbProducts = category.products || [];
-
     const key = normalizeCategory(category.name);
 
     // ✅ Only apply AI if category exists in fallback
@@ -829,7 +831,8 @@ const buildTopProducts = async (categories = []) => {
     const finalList = [];
     const usedNames = new Set();
 
-    // 1. Add DB products first
+    /* ---------------- 1. ADD DB PRODUCTS (MAX 10) ---------------- */
+
     for (const p of dbProducts) {
       const clean = exactProductName(p.name);
       const norm = normalizeName(clean);
@@ -843,27 +846,33 @@ const buildTopProducts = async (categories = []) => {
         usedNames.add(norm);
       }
 
-      if (finalList.length >= TOP_PRODUCTS_LIMIT) break;
+      if (finalList.length >= DB_LIMIT) break;
     }
 
-    // 2. Fill remaining with AI
-    if (finalList.length < TOP_PRODUCTS_LIMIT) {
-      for (const name of aiProducts) {
-        const clean = exactProductName(name);
-        const norm = normalizeName(clean);
+    /* ---------------- 2. ADD AI PRODUCTS (ALWAYS TRY 10) ---------------- */
 
-        if (!usedNames.has(norm)) {
-          finalList.push({
-            name: clean,
-            count: 0,
-            source: 'AI',
-          });
-          usedNames.add(norm);
-        }
+    let aiAdded = 0;
 
-        if (finalList.length >= TOP_PRODUCTS_LIMIT) break;
-      }
+    for (const name of aiProducts) {
+      const clean = exactProductName(name);
+      const norm = normalizeName(clean);
+
+      // ❌ skip duplicates with DB
+      if (usedNames.has(norm)) continue;
+
+      finalList.push({
+        name: clean,
+        count: 0,
+        source: 'AI',
+      });
+
+      usedNames.add(norm);
+      aiAdded++;
+
+      if (aiAdded >= AI_LIMIT) break;
     }
+
+    /* ---------------- FINAL CATEGORY ---------------- */
 
     finalCategories.push({
       name: category.name,
