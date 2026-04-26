@@ -118,9 +118,15 @@ What this code does:
 - does not change casing, units, punctuation, or numbers
 
 ```js
-const exactProductName = (value = '') => String(value || '').trim();
+const normalize = (value = '') => {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[,()\-_\[\]]+/g, ' ') // remove symbols like , ( ) - _ [ ]
+    .replace(/\s+/g, ' ')           // collapse multiple spaces
+    .trim();                        // remove leading/trailing spaces
+};
 
-module.exports = exactProductName;
+module.exports = normalize;
 ```
 
 ---
@@ -255,61 +261,77 @@ const { Logger: log } = require('sarvm-utility');
 const MongoProduct = require('../../models/mongoCatalog/productSchema');
 
 /**
- * Normalize string:
- * - lowercase
- * - remove spaces, commas, special characters
- * - keep only a-z and 0-9
+ * Normalize product name → same logic as dumK
  */
-const normalize = (str = '') =>
-  String(str)
+const normalizeKey = (name = '') =>
+  String(name)
+    .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9]/g, '') // removes spaces, commas, symbols
-    .trim();
+    .replace(/\s+/g, '_');
 
 /**
- * Build catalogue map using MongoDB product collection
+ * Match product names against MongoDB `product` collection.
+ * Uses dumK (dummyKey) for fast exact matching.
  *
  * @param {string[]} productNames
- * @returns {Promise<Map<string, { id: string, name: string }>>}
+ * @returns {Promise<Map<string, { id: string, name: string, dummyKey: string, image: string }>>}
  */
 const matchAgainstCatalogue = async (productNames = []) => {
+  if (!productNames.length) return new Map();
+
   const matchedMap = new Map();
 
   try {
-    if (!productNames.length) return matchedMap;
+    // Normalize + dedupe
+    const uniqueNames = [
+      ...new Set(
+        productNames.map((n) => normalizeKey(n)).filter(Boolean)
+      ),
+    ];
 
-    // Step 1: Normalize input product names
-    const normalizedInputSet = new Set(
-      productNames.map((name) => normalize(name)).filter(Boolean)
-    );
+    const CHUNK_SIZE = 200;
 
-    // Step 2: Fetch ALL products from Mongo (only required fields)
-    const products = await MongoProduct.find({})
-      .select('_id prdNm')
-      .lean()
-      .exec();
+    for (let i = 0; i < uniqueNames.length; i += CHUNK_SIZE) {
+      const chunk = uniqueNames.slice(i, i + CHUNK_SIZE);
 
-    // Step 3: Build lookup map (normalized name → product)
-    products.forEach((product) => {
-      const normalizedCatalogName = normalize(product.prdNm);
+      try {
+        // 🔥 Match using dumK (fast indexed lookup)
+        const results = await MongoProduct.find({
+          dumK: { $in: chunk },
+          status: 'PUBLISHED',
+        })
+          .select('_id prdNm dumK media.img1')
+          .lean();
 
-      // Only store if it exists in input set (optimization)
-      if (normalizedInputSet.has(normalizedCatalogName)) {
-        matchedMap.set(normalizedCatalogName, {
-          id: product._id,
-          name: product.prdNm,
+        results.forEach((product) => {
+          const key = product.dumK;
+
+          if (!matchedMap.has(key)) {
+            matchedMap.set(key, {
+              id: String(product._id),
+              name: product.prdNm,
+              dummyKey: product.dumK,
+              image: product?.media?.img1 || null,
+            });
+          }
+        });
+      } catch (chunkError) {
+        log.warn({
+          warn: 'CatalogueMatcher(Mongo): chunk query failed',
+          error: chunkError.message,
+          chunkSize: chunk.length,
         });
       }
-    });
+    }
 
     log.info({
-      info: 'Catalogue matching complete (EXACT MATCH MODE)',
-      inputCount: normalizedInputSet.size,
+      info: 'CatalogueMatcher(Mongo): matching complete',
+      inputCount: uniqueNames.length,
       matchedCount: matchedMap.size,
     });
   } catch (error) {
     log.error({
-      error: 'Catalogue matching failed',
+      error: 'CatalogueMatcher(Mongo): matching failed',
       details: error.message,
     });
   }
@@ -318,26 +340,22 @@ const matchAgainstCatalogue = async (productNames = []) => {
 };
 
 /**
- * Filter products using exact match catalogue map
- *
- * @param {Array} products
- * @param {Map} catalogueMap
- * @returns {Array}
+ * Filter products to only catalogue-matched ones
  */
 const filterByCatalogue = (products = [], catalogueMap) => {
   return products
     .map((product) => {
-      const normalizedName = normalize(product.name);
-
-      // EXACT MATCH ONLY
-      const matched = catalogueMap.get(normalizedName);
+      const key = normalizeKey(product.name);
+      const matched = catalogueMap.get(key);
 
       if (!matched) return null;
 
       return {
         ...product,
-        name: matched.name, // replace with exact catalog name
+        name: matched.name, // use canonical name
         catalogueProductId: matched.id,
+        dummyKey: matched.dummyKey,
+        image: matched.image,
       };
     })
     .filter(Boolean);
@@ -372,181 +390,202 @@ GEMINI_MODEL=gemini-2.0-flash
 ```js
 const { Logger: log } = require('sarvm-utility');
 
-// ─── PHASE 1: Static fallback catalog ────────────────────────────────
+/* ---------------- CATEGORY CONFIG ---------------- */
 
 const FRESH_CATEGORIES = new Set([
-  'dairy', 'vegetables', 'fruits', 'meat', 'fish', 'seafood',
-  'eggs', 'poultry', 'fresh produce', 'organic', 'farm fresh',
+  'dairy',
+  'vegetables',
+  'fruits',
+  'meat',
+  'fish',
+  'flowers',
+  'restaurant',
+  'home_food',
 ]);
+
+const normalizeCategory = (str = '') =>
+  String(str)
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .trim();
+
+const isFreshCategory = (categoryName) => {
+  return FRESH_CATEGORIES.has(normalizeCategory(categoryName));
+};
+
+/* ---------------- FALLBACK ---------------- */
 
 const fallbackCatalog = {
   dairy: [
-    'Amul Gold Milk 500ml', 'Mother Dairy Curd 400g', 'Amul Butter 100g',
-    'Amul Paneer 200g', 'Amul Cheese Slice', 'Nandini Ghee 1L',
-    'Amul Buttermilk 200ml', 'Amul Kool Chocolate', 'Milky Mist Cream 200ml',
-    'Nestle Yogurt 100g',
+    'Amul Gold Milk 500ml',
+    'Amul Taaza Milk 1L',
+    'Mother Dairy Curd 400g',
+    'Amul Butter 100g',
+    'Amul Paneer 200g',
   ],
   snacks: [
-    'Lays Classic Salted 52g', 'Parle-G Biscuits 250g', 'Haldiram Namkeen 200g',
-    'Kurkure Masala Munch 90g', 'Bikaji Bhujia 200g', 'Britannia Good Day 250g',
-    'Too Yumm Veggie Stix', 'Act II Popcorn 70g', 'Parle Monaco 200g',
+    'Lays Classic Salted 52g',
+    'Kurkure Masala Munch 90g',
     'Bingo Mad Angles 72g',
+    'Parle-G Biscuits 250g',
   ],
   beverages: [
-    'Bisleri Water 1L', 'Coca Cola 750ml', 'Tropicana Orange Juice 1L',
-    'Tata Tea Gold 500g', 'Nescafe Classic 50g', 'Red Bull 250ml',
-    'Thums Up 750ml', 'Amul Lassi 200ml', 'Nescafe Cold Coffee 200ml',
-    'Lipton Iced Tea 350ml',
+    'Bisleri Water 1L',
+    'Coca Cola 750ml',
+    'Pepsi 750ml',
+    'Tropicana Juice 1L',
   ],
-  staples: [
-    'India Gate Basmati Rice 5kg', 'Aashirvaad Atta 10kg', 'Tata Toor Dal 1kg',
-    'Tata Moong Dal 1kg', 'Tata Salt 1kg', 'Madhur Sugar 1kg',
-    'Fortune Sunflower Oil 1L', 'Maggi Poha 500g', 'Sooji Rava 500g',
-    'MTR Rava Idli Mix 500g',
-  ],
-  vegetables: [
-    'Tomato', 'Onion', 'Potato', 'Bhindi (Okra)', 'Brinjal',
-    'Capsicum', 'Carrot', 'Cauliflower', 'Cabbage', 'Green Chilli',
-  ],
-  fruits: [
-    'Banana', 'Apple', 'Mango', 'Grapes', 'Papaya',
-    'Watermelon', 'Pomegranate', 'Orange', 'Guava', 'Sapota (Chiku)',
-  ],
-  bakery: [
-    'Britannia Bread White', 'Amul Butter Bun', 'Britannia Rusk 300g',
-    'Monginis Cake Slice', 'Britannia Muffin Chocolate', 'Pav 6 Pack',
-    'Parle Khari 200g', 'Britannia Toast', 'Harvest Gold Brown Bread',
-    'Britannia Good Day Cookies 250g',
-  ],
-  personal_care: [
-    'Dove Soap 100g', 'Head & Shoulders Shampoo 180ml', 'Colgate MaxFresh 150g',
-    'Garnier Face Wash 100ml', 'Dettol Body Wash 250ml', 'Nivea Deo 150ml',
-    'Ponds Talc 300g', 'Vaseline Lotion 200ml', 'Oral-B Toothbrush',
-    'Parachute Hair Oil 200ml',
-  ],
+  vegetables: ['Tomato', 'Onion', 'Potato', 'Carrot'],
+  fruits: ['Banana', 'Apple', 'Orange', 'Mango'],
 };
 
-/**
- * Determine if a category should use fresh/local product names or brand/packaged names.
- */
-const isFreshCategory = (categoryName) => {
-  const normalized = String(categoryName || '').trim().toLowerCase().replace(/\s+/g, ' ');
-  return FRESH_CATEGORIES.has(normalized);
-};
-
-/**
- * Phase 1: Get static fallback products for given categories.
- */
 const getFallbackProducts = (categories = []) => {
-  const resolved = {};
+  const result = {};
 
-  categories.forEach((categoryName) => {
-    const key = String(categoryName || '')
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, '_');
-
-    if (fallbackCatalog[key]) {
-      resolved[categoryName] = fallbackCatalog[key];
-    }
+  categories.forEach((cat) => {
+    const key = normalizeCategory(cat);
+    result[cat] = fallbackCatalog[key] || [];
   });
 
-  if (!Object.keys(resolved).length) {
-    return fallbackCatalog;
-  }
-
-  return resolved;
+  return result;
 };
 
-// ─── PHASE 2: Gemini API Integration ─────────────────────────────────
+/* ---------------- GEMINI SETUP ---------------- */
 
 let geminiAvailable = false;
 let GoogleGenerativeAI = null;
 
-// Try to load Gemini SDK (install @google/generative-ai for Phase 2)
 try {
   const geminiModule = require('@google/generative-ai');
   GoogleGenerativeAI = geminiModule.GoogleGenerativeAI;
   geminiAvailable = true;
 } catch (e) {
-  // Gemini SDK not installed — Phase 1 mode, use fallback only
   geminiAvailable = false;
 }
 
-/**
- * Phase 2: Call Gemini to get category-aware product suggestions.
- *
- * For FRESH categories: returns common generic product names (e.g., "Tomato", "Paneer")
- * For PACKAGED categories: returns brand-specific names (e.g., "Lays Classic Salted 52g")
- *
- * @param {string} categoryName
- * @param {string[]} existingProducts - products already found from DB, to avoid duplicates
- * @returns {Promise<string[]>} Array of suggested product names
- */
+/* ---------------- PROMPT BUILDER ---------------- */
+
+const buildPrompt = (categoryName, existingProducts = []) => {
+  const isFresh = isFreshCategory(categoryName);
+  const existing = existingProducts.slice(0, 10).join(', ');
+
+  if (isFresh) {
+    return `
+Generate 15 common ${categoryName} products.
+
+Rules:
+- Use generic names (no brands)
+- Example: Tomato, Onion, Milk, Paneer
+${existing ? `Avoid: ${existing}` : ''}
+
+Return JSON array only.
+`;
+  }
+
+  return `
+Generate 15 realistic ${categoryName} products used in Indian stores.
+
+Rules:
+- Include brand + size
+- Example:
+  - Amul Gold Milk 500ml
+  - Lays Classic Salted 52g
+  - Bisleri Water 1L
+${existing ? `Avoid: ${existing}` : ''}
+
+Return JSON array only.
+`;
+};
+
+/* ---------------- GEMINI FUNCTION ---------------- */
+
 const getGeminiCategoryProducts = async (categoryName, existingProducts = []) => {
+  const normalized = normalizeCategory(categoryName);
+
+  /* -------- CHECK GEMINI AVAILABILITY -------- */
+
   if (!geminiAvailable || !process.env.GEMINI_API_KEY) {
-    log.info({ info: `AI Service: Gemini not available for category "${categoryName}", using fallback` });
-    const fallback = getFallbackProducts([categoryName]);
-    return fallback[categoryName] || fallback[categoryName?.replace(/\s+/g, '_')] || [];
+    log.warn({
+      warn: 'Gemini not available, using fallback',
+      category: categoryName,
+    });
+
+    const fallback = getFallbackProducts([normalized]);
+    return fallback[normalized] || [];
   }
 
   try {
+    log.info({
+      info: 'Gemini API call started',
+      category: categoryName,
+      existingCount: existingProducts.length,
+    });
+
     const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: process.env.GEMINI_MODEL || 'gemini-2.0-flash' });
 
-    const isFresh = isFreshCategory(categoryName);
-    const existingList = existingProducts.slice(0, 20).join(', ');
+    const model = genAI.getGenerativeModel({
+      model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+    });
 
-    let prompt;
-    if (isFresh) {
-      prompt = `You are a product catalog expert for Indian retail stores.
-For the category "${categoryName}", give me 15 common product names that Indian grocery stores typically sell.
-Since this is a fresh/local/unpackaged category, use common generic names (e.g., "Tomato", "Onion", "Paneer", "Curd").
-Do NOT use brand names for this category.
-${existingList ? `These products are already found: ${existingList}. Suggest DIFFERENT products not in this list.` : ''}
-Return ONLY a valid JSON array of short product name strings. No explanations.`;
-    } else {
-      prompt = `You are a product catalog expert for Indian retail stores.
-For the category "${categoryName}", give me 15 commonly sold products in Indian retail/grocery stores.
-Since this is a packaged/branded category, use specific brand names and pack sizes where relevant (e.g., "Lays Classic Salted 52g", "Parle-G 250g", "Colgate MaxFresh 150g").
-${existingList ? `These products are already found: ${existingList}. Suggest DIFFERENT products not in this list.` : ''}
-Return ONLY a valid JSON array of short product name strings. No explanations.`;
-    }
+    const prompt = buildPrompt(categoryName, existingProducts);
 
     const result = await model.generateContent(prompt);
     const responseText = result.response.text();
 
-    // Extract JSON array from response
-    const jsonMatch = responseText.match(/\[[\s\S]*?\]/);
-    if (!jsonMatch) {
-      log.warn({ warn: `AI Service: Gemini returned non-JSON for category "${categoryName}"` });
-      return getFallbackProducts([categoryName])[categoryName] || [];
+    log.info({
+      info: 'Gemini raw response received',
+      category: categoryName,
+      response: responseText,
+    });
+
+    /* -------- PARSE RESPONSE -------- */
+
+    const match = responseText.match(/\[[\s\S]*?\]/);
+
+    if (!match) {
+      throw new Error('Invalid JSON from Gemini');
     }
 
-    const parsed = JSON.parse(jsonMatch[0]);
+    const parsed = JSON.parse(match[0]);
+
     if (!Array.isArray(parsed)) {
-      return getFallbackProducts([categoryName])[categoryName] || [];
+      throw new Error('Gemini output not array');
     }
+
+    const cleaned = parsed
+      .map((name) => String(name).trim())
+      .filter(Boolean);
 
     log.info({
-      info: `AI Service: Gemini returned ${parsed.length} products for "${categoryName}" (${isFresh ? 'fresh' : 'packaged'})`,
+      info: 'Gemini parsed successfully',
+      category: categoryName,
+      productCount: cleaned.length,
     });
 
-    return parsed.map((name) => String(name).trim()).filter(Boolean);
+    return cleaned;
   } catch (error) {
     log.error({
-      error: `AI Service: Gemini call failed for category "${categoryName}"`,
-      details: error.message,
+      error: 'Gemini API failed',
+      category: categoryName,
+      message: error.message,
+      stack: error.stack,
     });
-    // Fallback on any error
-    return getFallbackProducts([categoryName])[categoryName] || [];
+
+    log.warn({
+      warn: 'Using fallback products',
+      category: categoryName,
+    });
+
+    const fallback = getFallbackProducts([normalized]);
+    return fallback[normalized] || [];
   }
 };
 
+/* ---------------- EXPORTS ---------------- */
+
 module.exports = {
-  normalizeNames: (names = [], normalizer) => names.map((name) => normalizer(name)).filter(Boolean),
-  getFallbackProducts,
   getGeminiCategoryProducts,
+  getFallbackProducts,
   isFreshCategory,
 };
 ```
@@ -568,121 +607,158 @@ const { Logger: log } = require('sarvm-utility');
 
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
 
+/* ---------------- CACHE ---------------- */
+
 /**
- * In-memory cache to avoid repeated HTTP calls
- * Key: profile URL
- * Value: pincode
+ * Cache: shopId → pincode
  */
 const pincodeCache = new Map();
 
-/**
- * Normalize shop record
- */
-const normalizeShop = (shop) => {
-  if (!shop?.shopId) return null;
+/* ---------------- HELPERS ---------------- */
+
+const normalizeShop = (doc) => {
+  if (!doc?.shopId) return null;
 
   return {
-    shopId: Number(shop.shopId),
-    url: shop.url || null,
+    shopId: Number(doc.shopId),
+    url: doc.url || null,
   };
 };
 
 /**
- * Fetch pincode from profile.json URL
+ * 🔥 ROBUST PINCODE EXTRACTOR (FIXED)
  */
-const getPincodeFromProfile = async (url) => {
+const extractPincode = (data = {}) => {
+  return (
+    data?.shop?.location?.pincode ||
+    data?.location?.pincode ||
+    data?.pincode ||
+    data?.vendor?.pincode ||
+    data?.address?.pincode ||
+    data?.shop?.pincode ||
+    null
+  );
+};
+
+/**
+ * Fetch pincode from URL (ONLY ONCE)
+ */
+const fetchPincodeFromURL = async (shopId, url) => {
   if (!url) return null;
 
-  // Cache hit
-  if (pincodeCache.has(url)) {
-    return pincodeCache.get(url);
+  // ✅ Check cache
+  if (pincodeCache.has(shopId)) {
+    return pincodeCache.get(shopId);
   }
 
   try {
+    console.log('👉 Fetching profile for shop:', shopId);
+    console.log('👉 URL:', url);
+
     const response = await axios.get(url, {
-      timeout: 3000,
+      timeout: 5000,
     });
 
     const data = response?.data || {};
 
-    const pincode =
-      data?.shop?.location?.pincode ||
-      data?.vendor?.pincode ||
-      null;
+    // 🔥 DEBUG (VERY IMPORTANT)
+    console.log('👉 PROFILE RESPONSE:', JSON.stringify(data, null, 2));
 
-    // Store in cache (even null to prevent retry spam)
-    pincodeCache.set(url, pincode);
+    const pincode = extractPincode(data);
 
-    return pincode;
+    console.log('👉 Extracted pincode:', pincode);
+
+    const finalPincode = pincode ? String(pincode) : null;
+
+    // ✅ Only cache VALID pincodes
+    if (finalPincode) {
+      pincodeCache.set(shopId, finalPincode);
+    }
+
+    return finalPincode;
   } catch (error) {
     log.warn({
-      warn: 'shopGeo: failed to fetch profile',
+      warn: 'Failed to fetch shop profile',
+      shopId,
       url,
       error: error.message,
     });
 
-    pincodeCache.set(url, null);
     return null;
   }
 };
 
-/**
- * Get all unique shop IDs from retailer catalog
- */
-const getAllRetailerShopIds = async () => {
-  const shopIds = await RetailerCatalog.distinct('shopId', {
-    shopId: { $ne: null },
-  });
-
-  return shopIds.map((id) => Number(id)).filter(Boolean);
-};
+/* ---------------- CORE FUNCTIONS ---------------- */
 
 /**
- * Get all shop records (shopId + url)
+ * Get all unique shops (shopId + url)
  */
 const getAllShops = async () => {
   const docs = await RetailerCatalog.find(
-    { shopId: { $ne: null }, url: { $ne: null } },
+    {
+      shopId: { $ne: null },
+      url: { $ne: null },
+    },
     { shopId: 1, url: 1 }
   ).lean();
+
+  console.log('👉 Total retailer docs:', docs.length);
 
   const map = new Map();
 
   docs.forEach((doc) => {
-    const normalized = normalizeShop(doc);
-    if (!normalized) return;
+    const shop = normalizeShop(doc);
+    if (!shop) return;
 
-    if (!map.has(normalized.shopId)) {
-      map.set(normalized.shopId, normalized);
+    if (!map.has(shop.shopId)) {
+      map.set(shop.shopId, shop);
     }
   });
 
-  return Array.from(map.values());
+  const shops = Array.from(map.values());
+
+  console.log('👉 Unique shops:', shops.length);
+
+  return shops;
 };
 
 /**
- * Get all shop locations (pincode resolved via profile URL)
+ * Get all shop locations (shopId → pincode)
  */
 const getAllShopLocations = async () => {
   const shops = await getAllShops();
 
   const results = [];
 
-  // Sequential processing (safe for Phase 1)
   for (const shop of shops) {
-    const pincode = await getPincodeFromProfile(shop.url);
+    let pincode;
 
-    results.push({
-      shopId: shop.shopId,
-      pincode: pincode ? String(pincode) : null,
-    });
+    if (pincodeCache.has(shop.shopId)) {
+      pincode = pincodeCache.get(shop.shopId);
+    } else {
+      pincode = await fetchPincodeFromURL(
+        shop.shopId,
+        shop.url
+      );
+    }
+
+    console.log('👉 Shop:', shop.shopId, 'Pincode:', pincode);
+
+    if (pincode) {
+      results.push({
+        shopId: shop.shopId,
+        pincode,
+      });
+    }
   }
+
+  console.log('👉 Final shop locations:', results.length);
 
   return results;
 };
 
 /**
- * Get shops filtered by pincode
+ * Get shops by pincode
  */
 const getShopsByPincode = async (targetPincode) => {
   const normalized = String(targetPincode);
@@ -698,22 +774,37 @@ const getShopsByPincode = async (targetPincode) => {
  * Get single shop location
  */
 const getShopLocation = async (shopId) => {
+  const numericShopId = Number(shopId);
+
   const shops = await getAllShops();
 
-  const shop = shops.find((s) => Number(s.shopId) === Number(shopId));
+  const shop = shops.find(
+    (s) => s.shopId === numericShopId
+  );
 
   if (!shop) return null;
 
-  const pincode = await getPincodeFromProfile(shop.url);
+  let pincode;
+
+  if (pincodeCache.has(shop.shopId)) {
+    pincode = pincodeCache.get(shop.shopId);
+  } else {
+    pincode = await fetchPincodeFromURL(
+      shop.shopId,
+      shop.url
+    );
+  }
 
   return {
     shopId: shop.shopId,
-    pincode: pincode ? String(pincode) : null,
+    pincode,
   };
 };
 
+/* ---------------- EXPORTS ---------------- */
+
 module.exports = {
-  getAllRetailerShopIds,
+  getAllShops,
   getAllShopLocations,
   getShopsByPincode,
   getShopLocation,
@@ -756,7 +847,10 @@ const exactProductName = require('../../utils/normalizeProduct');
 const aiService = require('./ai.service');
 const shopGeoService = require('./shopGeo.service');
 
-const TOP_PRODUCTS_LIMIT = 15;
+/* ---------------- CONFIG ---------------- */
+
+const DB_LIMIT = 10;   // max DB products per category
+const AI_LIMIT = 10;   // max AI products per category
 
 /* ---------------- HELPERS ---------------- */
 
@@ -767,8 +861,13 @@ const normalizeCategory = (str = '') =>
     .trim();
 
 const normalizeName = (str = '') =>
-  String(str).toLowerCase().replace(/[^a-z0-9]/g, '');
+  String(str)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
 
+/**
+ * Extract category from retailer doc
+ */
 const getCategoryName = (doc) => {
   const raw =
     doc?.category ||
@@ -813,25 +912,16 @@ const buildRetailerCategories = (retailerDocs = []) => {
 
 /* ---------------- STEP 2: MERGE DB + AI ---------------- */
 
-const DB_LIMIT = 10;
-const AI_LIMIT = 10;
-
 const buildTopProducts = async (categories = []) => {
-  const fallback = aiService.getFallbackProducts();
-
   const finalCategories = [];
 
   for (const category of categories) {
     const dbProducts = category.products || [];
-    const key = normalizeCategory(category.name);
-
-    // ✅ Only apply AI if category exists in fallback
-    const aiProducts = fallback[key] || [];
 
     const finalList = [];
     const usedNames = new Set();
 
-    /* ---------------- 1. ADD DB PRODUCTS (MAX 10) ---------------- */
+    /* -------- 1. ADD DB PRODUCTS -------- */
 
     for (const p of dbProducts) {
       const clean = exactProductName(p.name);
@@ -849,7 +939,25 @@ const buildTopProducts = async (categories = []) => {
       if (finalList.length >= DB_LIMIT) break;
     }
 
-    /* ---------------- 2. ADD AI PRODUCTS (ALWAYS TRY 10) ---------------- */
+    /* -------- 2. ADD AI PRODUCTS (CATEGORY-WISE) -------- */
+
+    let aiProducts = [];
+
+    try {
+      aiProducts = await aiService.getGeminiCategoryProducts(
+        category.name,
+        dbProducts.map((p) => p.name)
+      );
+    } catch (err) {
+      log.error({
+        error: 'AI generation failed',
+        category: category.name,
+        details: err.message,
+      });
+
+      const fallback = aiService.getFallbackProducts([category.name]);
+      aiProducts = fallback[category.name] || [];
+    }
 
     let aiAdded = 0;
 
@@ -857,7 +965,7 @@ const buildTopProducts = async (categories = []) => {
       const clean = exactProductName(name);
       const norm = normalizeName(clean);
 
-      // ❌ skip duplicates with DB
+      // skip duplicates
       if (usedNames.has(norm)) continue;
 
       finalList.push({
@@ -872,12 +980,14 @@ const buildTopProducts = async (categories = []) => {
       if (aiAdded >= AI_LIMIT) break;
     }
 
-    /* ---------------- FINAL CATEGORY ---------------- */
+    /* -------- FINAL CATEGORY -------- */
 
-    finalCategories.push({
-      name: category.name,
-      products: finalList,
-    });
+    if (finalList.length) {
+      finalCategories.push({
+        name: category.name,
+        products: finalList,
+      });
+    }
   }
 
   return finalCategories;
@@ -888,10 +998,18 @@ const buildTopProducts = async (categories = []) => {
 const buildPincodeCatalog = async (pincode) => {
   const normalizedPincode = String(pincode);
 
+  log.info({
+    info: `Building geo catalog for pincode: ${normalizedPincode}`,
+  });
+
+  /* -------- STEP 1: GET SHOPS -------- */
+
   const shops = await shopGeoService.getShopsByPincode(normalizedPincode);
   const shopIds = shops.map((s) => Number(s.shopId)).filter(Boolean);
 
   let categories = [];
+
+  /* -------- STEP 2: FETCH RETAILER PRODUCTS -------- */
 
   if (shopIds.length) {
     const retailerDocs = await RetailerCatalog.find({
@@ -899,29 +1017,40 @@ const buildPincodeCatalog = async (pincode) => {
       catalog: { $ne: null },
     }).lean();
 
-    // STEP 1: DB products
+    /* -------- STEP 3: BUILD DB PRODUCTS -------- */
+
     const retailerCategories = buildRetailerCategories(retailerDocs);
 
-    // STEP 2: Merge DB + AI
+    /* -------- STEP 4: MERGE DB + AI -------- */
+
     categories = await buildTopProducts(retailerCategories);
+  } else {
+    log.warn({
+      warn: `No shops found for pincode: ${normalizedPincode}`,
+    });
   }
 
-  categories = categories.filter((c) => c.products.length);
+  /* -------- STEP 5: SAVE RAW DATA (NO FILTERING) -------- */
 
-  // STEP 3: Save
   const document = await GeoCatalog.findOneAndUpdate(
     { level: 'PINCODE', pincode: normalizedPincode },
     {
       $set: {
         level: 'PINCODE',
         pincode: normalizedPincode,
-        categories,
+        categories, // 🔥 RAW DATA (IMPORTANT)
         lastBuildAt: new Date(),
-        buildStatus: 'SUCCESS',
+        buildStatus: categories.length ? 'SUCCESS' : 'FALLBACK',
       },
     },
     { upsert: true, new: true }
   );
+
+  log.info({
+    info: `Geo catalog built successfully`,
+    pincode: normalizedPincode,
+    categoryCount: document.categories.length,
+  });
 
   return {
     success: true,
@@ -952,19 +1081,26 @@ const { Logger: log } = require('sarvm-utility');
 
 const GeoCatalog = require('../../models/mongoCatalog/geoCatalogSchema');
 const RetailerCatalog = require('../../models/mongoCatalog/retailerSchema');
-const CustomCatalog = require('../../models/mongoCatalog/customCatalogSchema');
+
 const shopGeoService = require('./shopGeo.service');
+const { getMasterCatalogSet } = require('./masterCatalog.service');
 
 /* ---------------- HELPERS ---------------- */
 
 const normalize = (str = '') =>
-  String(str).toLowerCase().replace(/[^a-z0-9]/g, '').trim();
+  String(str)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '')
+    .trim();
 
 const normalizeCategory = (str = '') =>
-  String(str).toLowerCase().replace(/\s+/g, '_').trim();
+  String(str)
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .trim();
 
 /**
- * Group shop products by category
+ * Build shop category map
  */
 const buildShopCategoryMap = (retailerDocs = []) => {
   const map = new Map();
@@ -997,8 +1133,20 @@ const buildShopCategoryMap = (retailerDocs = []) => {
 };
 
 /**
- * Merge logic:
- * COMMON → SHOP ONLY → GEO ONLY
+ * 🔥 FILTER GEO PRODUCTS USING MASTER CATALOG
+ */
+const filterGeoProducts = (geoProducts = [], masterSet) => {
+  return geoProducts.filter((p) =>
+    masterSet.has(normalize(p.name))
+  );
+};
+
+/**
+ * 🔥 CORE MERGE LOGIC
+ *
+ * 1. COMMON
+ * 2. RETAILER
+ * 3. GEO
  */
 const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
   const geoMap = new Map();
@@ -1012,7 +1160,8 @@ const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
   const shopOnly = [];
   const geoOnly = [];
 
-  // Step 1: COMMON + SHOP ONLY
+  /* -------- STEP 1: COMMON + SHOP -------- */
+
   for (const shopProduct of shopProducts) {
     const norm = normalize(shopProduct.name);
 
@@ -1034,7 +1183,8 @@ const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
     }
   }
 
-  // Step 2: GEO ONLY
+  /* -------- STEP 2: GEO ONLY -------- */
+
   for (const geoProduct of geoProducts) {
     const norm = normalize(geoProduct.name);
 
@@ -1049,11 +1199,17 @@ const mergeCategoryProducts = (shopProducts = [], geoProducts = []) => {
   return [...common, ...shopOnly, ...geoOnly];
 };
 
-/* ---------------- MAIN LOGIC ---------------- */
+/* ---------------- MAIN FUNCTION ---------------- */
 
-const getGeoCatalogWithFallback = async ({ shopId, pincode, city, state, country }) => {
+const getGeoCatalogWithFallback = async ({
+  shopId,
+  pincode,
+  city,
+  state,
+  country,
+}) => {
   try {
-    /* ---------- STEP 1: Get Geo Catalog ---------- */
+    /* -------- STEP 1: FETCH GEO CATALOG -------- */
 
     let geoCatalog = null;
 
@@ -1067,30 +1223,43 @@ const getGeoCatalogWithFallback = async ({ shopId, pincode, city, state, country
     }
 
     if (!geoCatalog && city) {
-      geoCatalog = await GeoCatalog.findOne({ level: 'CITY', city })
+      geoCatalog = await GeoCatalog.findOne({
+        level: 'CITY',
+        city,
+      })
         .sort({ updatedAt: -1 })
         .lean();
     }
 
     if (!geoCatalog && state) {
-      geoCatalog = await GeoCatalog.findOne({ level: 'STATE', state })
+      geoCatalog = await GeoCatalog.findOne({
+        level: 'STATE',
+        state,
+      })
         .sort({ updatedAt: -1 })
         .lean();
     }
 
     if (!geoCatalog && country) {
-      geoCatalog = await GeoCatalog.findOne({ level: 'COUNTRY', country })
+      geoCatalog = await GeoCatalog.findOne({
+        level: 'COUNTRY',
+        country,
+      })
         .sort({ updatedAt: -1 })
         .lean();
     }
 
     if (!geoCatalog) return null;
 
-    /* ---------- STEP 2: If NO shopId → return as-is ---------- */
+    /* -------- STEP 2: IF NO SHOP → RETURN RAW -------- */
 
     if (!shopId) return geoCatalog;
 
-    /* ---------- STEP 3: Fetch Shop Products ---------- */
+    /* -------- STEP 3: GET MASTER CATALOG -------- */
+
+    const masterSet = await getMasterCatalogSet();
+
+    /* -------- STEP 4: FETCH SHOP PRODUCTS -------- */
 
     const retailerDocs = await RetailerCatalog.find({
       shopId: Number(shopId),
@@ -1103,22 +1272,31 @@ const getGeoCatalogWithFallback = async ({ shopId, pincode, city, state, country
 
     const shopCategoryMap = buildShopCategoryMap(retailerDocs);
 
-    /* ---------- STEP 4: Merge ONLY shop categories ---------- */
+    /* -------- STEP 5: CATEGORY-WISE PROCESS -------- */
 
     const finalCategories = [];
 
     geoCatalog.categories.forEach((geoCategory) => {
       const categoryName = normalizeCategory(geoCategory.name);
 
-      // ❗ Only include if shop has this category
+      // ❗ Only include categories present in shop
       if (!shopCategoryMap.has(categoryName)) return;
 
       const shopProducts = shopCategoryMap.get(categoryName);
       const geoProducts = geoCategory.products || [];
 
+      /* -------- 🔥 FILTER GEO PRODUCTS -------- */
+
+      const filteredGeoProducts = filterGeoProducts(
+        geoProducts,
+        masterSet
+      );
+
+      /* -------- 🔥 MERGE -------- */
+
       const mergedProducts = mergeCategoryProducts(
         shopProducts,
-        geoProducts
+        filteredGeoProducts
       );
 
       finalCategories.push({
@@ -1140,72 +1318,8 @@ const getGeoCatalogWithFallback = async ({ shopId, pincode, city, state, country
   }
 };
 
-/* ---------------- APPLY FUNCTION (UNCHANGED) ---------------- */
-
-const applyGeoCatalogToShop = async ({ shopId, pincode }) => {
-  const numericShopId = Number(shopId);
-
-  const location = (await shopGeoService.getShopLocation(numericShopId)) || {};
-
-  const catalog = await getGeoCatalogWithFallback({
-    shopId,
-    pincode: pincode || location.pincode,
-    city: location.city,
-    state: location.state,
-    country: location.country || 'India',
-  });
-
-  if (!catalog) {
-    return { success: false, message: 'No geo catalog found' };
-  }
-
-  const retailerDoc = await RetailerCatalog.findOne({ shopId: numericShopId })
-    .select('retailerId guid')
-    .lean();
-
-  const operations = [];
-
-  catalog.categories.forEach((category) => {
-    (category.products || []).forEach((product) => {
-      operations.push({
-        updateOne: {
-          filter: {
-            shopId: numericShopId,
-            productId: `geo-${category.name}-${product.name}`,
-          },
-          update: {
-            $set: {
-              shopId: numericShopId,
-              retailerId: retailerDoc?.retailerId || '',
-              guid: retailerDoc?.guid || '',
-              retailerName: 'Geo Catalog Auto Apply',
-              productId: `geo-${category.name}-${product.name}`,
-              productName: product.name,
-              productNameStatus: 'NEW',
-              category: category.name,
-              subCategory: category.name,
-            },
-          },
-          upsert: true,
-        },
-      });
-    });
-  });
-
-  if (operations.length) {
-    await CustomCatalog.bulkWrite(operations, { ordered: false });
-  }
-
-  return {
-    success: true,
-    categories: catalog.categories.length,
-    insertedProducts: operations.length,
-  };
-};
-
 module.exports = {
   getGeoCatalogWithFallback,
-  applyGeoCatalogToShop,
 };
 ```
 
@@ -1229,7 +1343,9 @@ const {
   applyGeoCatalogToShop,
   getGeoCatalogWithFallback,
 } = require('../../services/v1/geoHierarchy.service');
+
 const shopGeoService = require('../../services/v1/shopGeo.service');
+const { runGeoCatalogJobOnce } = require('../../../jobs/geoCatalog.job');
 
 /* ---------------- TEST PINCODE ---------------- */
 
@@ -1349,18 +1465,16 @@ const applyGeoCatalog = async (req, res) => {
   }
 };
 
-/* ---------------- GET GEO CATALOG (UPDATED) ---------------- */
+/* ---------------- GET GEO CATALOG ---------------- */
 
 const getResolvedGeoCatalog = async (req, res) => {
   try {
     const { shopId, pincode } = req.query;
 
-    // ✅ Resolve shop location if shopId present
     const location = shopId
       ? await shopGeoService.getShopLocation(Number(shopId))
       : null;
 
-    // ✅ IMPORTANT: pass shopId into service
     const catalog = await getGeoCatalogWithFallback({
       shopId: shopId ? Number(shopId) : null,
       pincode: pincode || location?.pincode,
@@ -1384,7 +1498,6 @@ const getResolvedGeoCatalog = async (req, res) => {
     log.error({
       error: 'Error in getResolvedGeoCatalog',
       details: error.message,
-      stack: error.stack,
     });
 
     return res.status(500).json({
@@ -1394,11 +1507,40 @@ const getResolvedGeoCatalog = async (req, res) => {
   }
 };
 
+/* ---------------- 🔥 MANUAL CRON TRIGGER ---------------- */
+
+const triggerCronManually = async (req, res) => {
+  try {
+    log.info({ info: 'Manual geo cron trigger started' });
+
+    // Run async (non-blocking)
+    runGeoCatalogJobOnce();
+
+    return res.status(202).json({
+      success: true,
+      message: 'Geo catalog cron job triggered successfully',
+    });
+  } catch (error) {
+    log.error({
+      error: 'Error triggering cron manually',
+      details: error.message,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to trigger cron job',
+    });
+  }
+};
+
+/* ---------------- EXPORTS ---------------- */
+
 module.exports = {
   testPincodeCatalog,
   testShopCatalog,
   applyGeoCatalog,
   getResolvedGeoCatalog,
+  triggerCronManually, // 🔥 IMPORTANT
 };
 ```
 
@@ -1486,18 +1628,19 @@ const shopGeoService = require('../apis/services/v1/shopGeo.service');
 const { buildPincodeCatalog } = require('../apis/services/v1/pincodeCatalogBuilder.service');
 const { rebuildHierarchyCatalogs } = require('../apis/services/v1/geoHierarchy.service');
 
-// ✅ NEW: Import GeoCatalog model to read existing pincodes
-const GeoCatalog = require('../apis/models/mongoCatalog/geoCatalogSchema');
-
 let isStarted = false;
 let isRunning = false;
 
+// Delay helper to avoid overloading APIs
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Configurable delay between pincode builds (ms)
 const PINCODE_DELAY_MS = parseInt(process.env.GEO_CRON_PINCODE_DELAY_MS || '2000', 10);
 
 /**
- * Run the geo catalog job once
+ * Run the full geo catalog job once.
+ * Processes ONE pincode at a time (sequential, not parallel).
+ * Each pincode may call Gemini API, so we space them out.
  */
 const runGeoCatalogJobOnce = async () => {
   if (isRunning) {
@@ -1511,72 +1654,56 @@ const runGeoCatalogJobOnce = async () => {
   try {
     log.info({ info: 'Geo catalog job started' });
 
-    // Step 1: Get all shop locations
     const shopLocations = await shopGeoService.getAllShopLocations();
 
-    // Step 2: Extract all pincodes from shops
-    const allPincodes = [
+    const pincodes = [
       ...new Set(
-        shopLocations
-          .map((shop) => shop?.pincode)
-          .filter(Boolean)
+        shopLocations.map((shop) => shop?.pincode).filter(Boolean)
       ),
     ];
 
-    // ✅ NEW: Fetch already processed pincodes from geo_catalogs
-    const existingCatalogs = await GeoCatalog.find({ level: 'PINCODE' })
-      .select('pincode')
-      .lean();
-
-    // ✅ NEW: Convert existing pincodes into a Set for fast lookup
-    const existingPincodeSet = new Set(
-      existingCatalogs.map((doc) => String(doc.pincode))
-    );
-
-    // ✅ NEW: Filter only NEW pincodes (not already processed)
-    const newPincodes = allPincodes.filter(
-      (pincode) => !existingPincodeSet.has(String(pincode))
-    );
-
     log.info({
-      info: `Geo catalog job: total pincodes = ${allPincodes.length}, new pincodes = ${newPincodes.length}`,
+      info: `Geo catalog job: processing ${pincodes.length} pincodes sequentially`,
     });
 
     let successCount = 0;
     let failCount = 0;
 
-    // ✅ CHANGED: Loop ONLY through new pincodes instead of all
-    for (let i = 0; i < newPincodes.length; i++) {
-      const pincode = newPincodes[i];
+    // Process ONE pincode at a time
+    for (let i = 0; i < pincodes.length; i++) {
+      const pincode = pincodes[i];
 
       try {
         log.info({
-          info: `Processing NEW pincode ${pincode} (${i + 1}/${newPincodes.length})`,
+          info: `Geo catalog job: processing pincode ${pincode} (${i + 1}/${pincodes.length})`,
         });
 
         await buildPincodeCatalog(pincode);
         successCount++;
       } catch (error) {
         failCount++;
+
         log.error({
-          error: `Failed for pincode ${pincode}`,
+          error: `Geo catalog job: failed for pincode ${pincode}`,
           details: error.message,
         });
+
+        // Continue to next pincode — don't stop the whole job
       }
 
-      // Delay to avoid overloading system / Gemini API
-      if (i < newPincodes.length - 1) {
+      // Delay between pincodes to avoid API rate limits
+      if (i < pincodes.length - 1) {
         await delay(PINCODE_DELAY_MS);
       }
     }
 
-    // Rebuild hierarchy after processing
+    // Rebuild hierarchy after all pincodes are processed
     try {
       await rebuildHierarchyCatalogs();
       log.info({ info: 'Geo catalog job: hierarchy rebuild complete' });
     } catch (error) {
       log.error({
-        error: 'Hierarchy rebuild failed',
+        error: 'Geo catalog job: hierarchy rebuild failed',
         details: error.message,
       });
     }
@@ -1585,8 +1712,7 @@ const runGeoCatalogJobOnce = async () => {
 
     log.info({
       info: 'Geo catalog job completed',
-      totalPincodes: allPincodes.length,
-      newPincodes: newPincodes.length,
+      pincodesProcessed: pincodes.length,
       successCount,
       failCount,
       durationSeconds,
@@ -1603,7 +1729,8 @@ const runGeoCatalogJobOnce = async () => {
 };
 
 /**
- * Schedule cron at 2 AM IST
+ * Schedule the nightly cron job.
+ * Runs at 2:00 AM IST every day.
  */
 const startGeoCatalogJob = () => {
   if (isStarted) return;
@@ -1627,6 +1754,7 @@ const startGeoCatalogJob = () => {
   );
 
   isStarted = true;
+
   log.info({ info: 'Geo catalog cron job scheduled at 2:00 AM IST' });
 };
 
