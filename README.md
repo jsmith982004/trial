@@ -5,7 +5,10 @@
 ### File 1: `backend/catalogue_mgmt_service/src/apis/utils/normalizeProduct.js`
 
 **Why the code is there & What it is doing:**
-This file contains the core string normalization utility `normalizeProduct`. Its primary function is to sanitize raw product names to a standardized format before they are processed by the system. Specifically, it converts the input string to lowercase, strips out common punctuation and structural symbols like commas, parentheses, hyphens, underscores, and brackets (using a Regex `/[,()-_[]]+/g`), and collapses any multiple contiguous spaces into a single space. By doing this, it ensures that "Amul Gold (500ml)" and "amul gold 500ml" are treated identically. This is critical for deduplication when merging AI-generated products with database-sourced products, and when performing lookups against the master catalog to prevent redundant or orphaned entries.
+- **Purpose:** Acts as the core string normalization utility.
+- **Functionality:** Sanitizes raw product names to a standardized format before processing.
+- **Transformations:** Converts text to lowercase, removes common punctuation/symbols (commas, parentheses, hyphens, brackets), and collapses multiple spaces into one.
+- **Impact:** Ensures consistent string matching across different data sources (e.g., AI output vs. database), preventing redundant entries for similar inputs like "Amul Gold (500ml)" and "amul gold 500ml".
 
 **The Full Code:**
 ```js
@@ -25,7 +28,10 @@ module.exports = normalize;
 ### File 2: `backend/catalogue_mgmt_service/src/apis/models/mongoCatalog/geoCatalogSchema.js`
 
 **Why the code is there & What it is doing:**
-This file defines the strict Mongoose schema for the `geo_catalogs` MongoDB collection, which acts as the pre-compiled cache for the entire geo-intelligent system. The architecture revolves around a multi-level geographic hierarchy specified by the `level` field, which can be `PINCODE`, `CITY`, `STATE`, or `COUNTRY`. It stores individual geographic identifiers (like `pincode` or `state`) alongside a list of categorized products. A critical architectural change implemented here is the segregation of products inside categories into two sub-sections: `trending` and `popular`. `trending` arrays hold products sourced from actual transactional data and shop inventory (DB), while `popular` arrays hold fallback items synthesized by the Gemini AI. The schema also tracks the last build time and build status to allow the cron job to manage partial failures. Efficient sparse indexes are defined on level combinations to guarantee millisecond lookups when serving the frontend.
+- **Purpose:** Defines the Mongoose schema for the `geo_catalogs` MongoDB collection.
+- **Architecture:** Supports a multi-level geographic hierarchy mapping products to a specific `level` (`PINCODE`, `CITY`, `STATE`, or `COUNTRY`).
+- **Product Segregation:** Organizes products inside categories into `trending` (sourced from actual shop inventory) and `popular` (AI-synthesized fallback items).
+- **Optimization:** Includes sparse indexes on geographic combinations for fast retrieval and tracks `buildStatus` to manage cron job failures gracefully.
 
 **The Full Code:**
 ```js
@@ -184,7 +190,10 @@ module.exports = GeoCatalog;
 **Why the code is there & What it is doing:**
 **This file is necessary for manual triggering of cron job. To test uncomment this file.**
 
-This file implements the `matchAgainstCatalogue` service, a heavy-lifting component designed to map loosely defined or generated product names directly to canonical master catalogue records stored in MongoDB. The script first filters and deduplicates incoming product names. To bypass connection timeouts or massive memory spikes, it breaks the array into manageable chunks (e.g., 200 items). It queries the `product` collection specifically searching for exact matches using the `dumK` (dummyKey) field, ensuring only `PUBLISHED` products are fetched. It returns a structured `Map` mapping the normalized names to official canonical data including `id`, `name`, `dummyKey`, and `image` (e.g., `media.img1`). The `filterByCatalogue` function then iterates over raw product lists and strips out any item that failed to match, ensuring zero invalid or unorderable products leak into the generated geo catalogs.
+- **Purpose:** Maps loosely defined or generated product names to canonical master catalogue records.
+- **Performance:** Deduplicates incoming product names and processes them in small chunks (e.g., 200 items) to prevent database timeouts or memory spikes.
+- **Matching Logic:** Queries the MongoDB `product` collection using the exact `dumK` (dummyKey) field, targeting only `PUBLISHED` items.
+- **Validation:** Filters out any generated products that fail to match an official product ID, ensuring unorderable items never reach the geo catalogs.
 
 **The Full Code:**
 ```js
@@ -303,7 +312,10 @@ This file implements the `matchAgainstCatalogue` service, a heavy-lifting compon
 ### File 4: `backend/catalogue_mgmt_service/src/apis/services/v1/ai.service.js`
 
 **Why the code is there & What it is doing:**
-This file handles the complete integration layer with the Google Generative AI (Gemini) SDK. It acts as the intelligent fallback when local shop data is too sparse to generate a meaningful catalog. The module classifies incoming product categories as either "fresh" (e.g., vegetables, meat) or "packaged" (e.g., snacks, beverages). Based on this classification, it dynamically constructs strict prompts to enforce Gemini to return exactly 10 items in a pure JSON array format without conversational fluff—asking for generic names for fresh goods, and specific brand-and-size combinations for packaged goods. It also implements an essential retry loop: if Gemini returns fewer than the required items, it makes a secondary call and merges the results. Finally, it features an extensive error classifier (`classifyGeminiError`) that captures and formats granular error messages regarding API keys, rate limits, model availability, network timeouts, and content blocks to aid system debugging.
+- **Purpose:** Integrates with the Google Generative AI (Gemini) SDK to provide intelligent catalog fallbacks.
+- **Prompt Engineering:** Categorizes inputs as "fresh" (e.g., vegetables) or "packaged" (e.g., snacks) to dynamically construct tailored AI prompts.
+- **Formatting:** Enforces strict JSON array outputs of exactly 10 items without conversational text.
+- **Reliability:** Features an automated retry loop for insufficient results and comprehensive error classification (`classifyGeminiError`) for tracking API limits, key issues, and timeouts.
 
 **The Full Code:**
 ```js
@@ -558,7 +570,9 @@ module.exports = {
 ### File 5: `backend/catalogue_mgmt_service/src/apis/services/v1/shopGeo.service.js`
 
 **Why the code is there & What it is doing:**
-This file provides the `shopGeo` service, a crucial optimization layer that connects directly to the PostgreSQL database via Knex. Historically, resolving shop locations involved querying external S3 profile JSONs via Axios, which caused severe rate-limiting and latency bottlenecks during cron execution. This refactored service executes a raw SQL query joining the `shop` and `store_meta_data` tables to instantly pull the `pincode`, `city`, and `state` for all verified shops in the SARVM ecosystem. It exposes multiple helper functions like `getAllShopLocations`, `getShopsByPincode`, and `getShopLocation` that format and return clean geographic data objects, acting as the foundational data source dictating which pincodes and cities the overnight geo-catalog cron job needs to process.
+- **Purpose:** Retrieves geographic location data (`pincode`, `city`, `state`) directly from PostgreSQL via Knex.
+- **Optimization:** Replaces slow HTTP requests to external S3 profile JSONs with efficient raw SQL joins across the `shop` and `store_meta_data` tables.
+- **Role:** Serves as the foundational data source dictating which active regions the overnight geo-catalog cron job needs to process.
 
 **The Full Code:**
 ```js
@@ -837,7 +851,10 @@ module.exports = {
 ### File 6: `backend/catalogue_mgmt_service/src/apis/services/v1/pincodeCatalogBuilder.service.js`
 
 **Why the code is there & What it is doing:**
-This file is the primary engine of the catalog generation system. It defines the pipeline for building catalogs at various granularities (`buildPincodeCatalog`, `buildCityCatalog`, `buildStateCatalog`, `buildCountryCatalog`). For the base pincode level, it identifies all shops operating in that pincode, pulls their active inventories, and computes a frequency map to identify the most common locally demanded products (the "trending" section). It then scans core vertical categories, and if a category has insufficient local data, it invokes `ai.service.js` to intelligently hallucinate "popular" fallback products. Both sets are then passed through the `catalogueMatcher` to guarantee they exist in the master database. Finally, it formats this dual-sectioned data according to the `geoCatalogSchema` and upserts the complete document into MongoDB. Higher-level builds (City, State, Country) simply aggregate the child catalogs recursively without needing to hit the AI or the raw shop inventories again.
+- **Purpose:** Acts as the primary engine for building regional catalogs.
+- **Data Aggregation:** Scans all shops in a target pincode to compute a frequency map of actual locally demanded products (the "trending" section).
+- **AI Fallback:** Invokes `ai.service.js` for categories lacking sufficient real-world data to generate "popular" fallback products.
+- **Pipeline:** Validates all aggregated items through `catalogueMatcher` and upserts the finalized, segregated documents directly into MongoDB.
 
 **The Full Code:**
 ```js
@@ -1435,7 +1452,10 @@ module.exports = {
 **Why the code is there & What it is doing:**
 **This file is necessary for manual triggering of cron job. To test uncomment this file.**
 
-This service establishes the core fallback resolution logic utilized by the frontend and shop-syncing modules. Because a specific local Pincode catalog might fail to generate or have zero active shops, the system cannot afford to return an empty response to the user. This file exposes routines that sequentially broaden the geographic search scope. It first attempts to find a matching `PINCODE` catalog in MongoDB. If none exists, it searches for the encompassing `CITY` catalog. If that fails, it falls back to the `STATE`, and finally to the global `COUNTRY` catalog. This guarantees a 100% catalog availability SLA across the platform, seamlessly delivering the most granular data available for any given location.
+- **Purpose:** Establishes the core fallback resolution logic to guarantee catalog availability.
+- **Flow:** Searches MongoDB sequentially, starting at the `PINCODE` level.
+- **Fallback Chain:** If a specific local catalog is missing or empty, it systematically broadens the search scope (`CITY` -> `STATE` -> `COUNTRY`).
+- **Impact:** Ensures the frontend and new merchants always receive the most granular and robust catalog data available without returning empty states.
 
 **The Full Code:**
 ```js
@@ -1756,7 +1776,9 @@ This service establishes the core fallback resolution logic utilized by the fron
 **Why the code is there & What it is doing:**
 **This file is necessary for manual triggering of cron job. To test uncomment this file.**
 
-This file interfaces directly with the central master catalog PostgreSQL database. While `catalogueMatcher.service.js` was historically tuned for MongoDB lookups, this service represents the canonical truth in the relational DB context. It provides robust query functions to fetch valid, orderable products filtering by active status. It plays an essential role in validating that generated products (whether inferred from shop history or hallucinated by Gemini) actually correspond to real SKUs provisioned within the SARVM ecosystem. Any product that fails verification against this service is silently discarded before it ever reaches the user-facing `geo_catalogs` collections.
+- **Purpose:** Interfaces directly with the central master catalog in the PostgreSQL database.
+- **Role:** Represents the canonical truth for all valid, active products within the SARVM ecosystem.
+- **Validation:** Provides robust query functions to filter out inactive products and verify that generated AI suggestions correspond to real, provisioned SKUs.
 
 **The Full Code:**
 ```js
@@ -1974,7 +1996,9 @@ This file interfaces directly with the central master catalog PostgreSQL databas
 ### File 9: `backend/catalogue_mgmt_service/src/apis/services/v1/popularProduct.service.js`
 
 **Why the code is there & What it is doing:**
-This module serves as the legacy or alternative provider for trending items. It is responsible for analyzing historical transaction tables, user search behaviors, or existing predefined databases to generate ranked lists of popular products. Within the geo-catalog architecture, outputs from this service often populate the DB-sourced `trending` section of the geographic catalog before the AI component steps in to fill gaps. It abstracts the complex aggregation queries required to measure product velocity and demand across different sectors, providing a clean programmatic interface for the controllers and cron builders to fetch pre-calculated popular items.
+- **Purpose:** Analyzes transactional data, shop inventories, or existing databases to generate ranked lists of popular products.
+- **Role in Pipeline:** Populates the foundational, DB-sourced "trending" section of the geo-catalog before AI steps in to fill gaps.
+- **Abstraction:** Encapsulates complex SQL/NoSQL aggregations into a clean interface for controllers and cron jobs.
 
 **The Full Code:**
 ```js
@@ -2258,7 +2282,9 @@ module.exports = {
 ### File 10: `backend/catalogue_mgmt_service/src/apis/services/v1/unverifiedShopSync.service.js`
 
 **Why the code is there & What it is doing:**
-This file manages the provisioning of catalogs for new, unverified, or bulk-imported merchants (such as those imported from Google Maps). New shops suffer from the "cold start" problem, where their digital storefronts are completely empty upon registration. This service listens for new unverified shop creations, identifies their geographic location using `shopGeo.service.js`, and automatically clones the appropriate pre-compiled geographic catalog (via `geoHierarchy.service.js`) into the shop's personal `customcatalogs` collection. This instantly provides the merchant with a highly relevant, localized, and fully populated catalog, requiring minimal manual configuration on their end.
+- **Purpose:** Manages catalog provisioning for new, unverified, or bulk-imported merchants (e.g., Google Maps imports).
+- **Problem Solved:** Eliminates the "cold start" problem by preventing digital storefronts from appearing empty upon registration.
+- **Automation:** Uses `shopGeo.service.js` to find a new shop's location and automatically clones the appropriate hierarchical catalog into their personal `customcatalogs` collection.
 
 **The Full Code:**
 ```js
@@ -2803,7 +2829,9 @@ module.exports = {
 ### File 11: `backend/catalogue_mgmt_service/src/apis/controllers/v1/popularProduct.js`
 
 **Why the code is there & What it is doing:**
-This Express controller acts as the HTTP interface for popular product functionalities. It exposes REST API endpoints that the frontend application consumes to fetch trending lists. The file handles standard controller duties: parsing incoming HTTP requests, validating query parameters (like pagination limits or specific categories), delegating the business logic to the `popularProduct.service.js` layer, and mapping the resulting datasets back into standardized JSON HTTP responses. It includes standard `try/catch` error handling to ensure server exceptions are gracefully converted into `500 Internal Server Error` responses with appropriate error messages.
+- **Purpose:** Serves as the HTTP interface for popular product functionalities.
+- **Operations:** Parses incoming queries, validates pagination/category parameters, and delegates logic to `popularProduct.service.js`.
+- **Response Handling:** Maps processed datasets into standardized JSON APIs and converts server exceptions into clean `500 Internal Server Error` responses.
 
 **The Full Code:**
 ```js
@@ -2843,7 +2871,9 @@ module.exports = {
 ### File 12: `backend/catalogue_mgmt_service/src/apis/controllers/v1/geo.js`
 
 **Why the code is there & What it is doing:**
-This file represents the main Express controller for interacting with the Geographic Intelligent Catalog System via HTTP. It provides endpoints crucial for both Phase 1 testing and Phase 2 production manual overrides. Functions inside this controller include handlers to manually test the catalog building pipeline for a specific Pincode or `shopId` (`buildCatalogByPincode`), an endpoint to force-apply a geographic catalog directly to a target shop (`applyGeoCatalog`), an endpoint to instantly trigger the background cron job on-demand (`triggerCron`), and standard endpoints to fetch the finalized catalogs for the frontend UI. It parses the request body/query, invokes the underlying services, and formats the final API response.
+- **Purpose:** The primary Express controller for HTTP interactions with the Geographic Catalog System.
+- **Key Endpoints:** Contains handlers to test catalog builds by Pincode/shopId, force-apply catalogs to specific shops, and instantly trigger the cron job on demand.
+- **Flow:** Parses HTTP request bodies, invokes underlying services, and formats the finalized output for the frontend UI.
 
 **The Full Code:**
 ```js
@@ -3099,7 +3129,8 @@ const { Logger: log } = require('sarvm-utility');
 ### File 13: `backend/catalogue_mgmt_service/src/apis/routes/v1/geo.js`
 
 **Why the code is there & What it is doing:**
-This file is strictly responsible for Express routing configurations related to the geographic catalog feature. It imports the handler functions from the `geo.js` controller and binds them to specific HTTP verbs and URL paths under the `/v1/geo/` prefix. Defined routes include `POST /test/pincode`, `POST /test/shop`, `GET /catalog`, `POST /apply`, and `POST /cron/trigger`. It essentially acts as the wiring layer, ensuring that when the router receives an HTTP request on these endpoints, it accurately invokes the corresponding controller logic.
+- **Purpose:** Responsible for Express routing configurations specific to the geographic catalog feature.
+- **Wiring:** Binds controller functions to specific HTTP verbs and paths (e.g., `POST /test/pincode`, `GET /catalog`) under the `/v1/geo/` prefix.
 
 **The Full Code:**
 ```js
@@ -3181,7 +3212,9 @@ module.exports = router;
 ### File 14: `backend/catalogue_mgmt_service/src/jobs/geoCatalog.job.js`
 
 **Why the code is there & What it is doing:**
-This file defines the robust background cron job scheduler powered by `node-cron`. Designed to execute nightly at 2:00 AM IST, it serves as the automated heart of the catalog system. The job follows a highly resilient "Progressive Pipeline" architecture: it first builds all Pincode catalogs, then aggregates those into City catalogs, then into State catalogs, and finally into a global Country catalog. Crucially, it processes regions sequentially and enforces an intentional delay (`GEO_CRON_PINCODE_DELAY_MS`) between API calls to prevent tripping Google Gemini rate limits. The entire routine is wrapped in granular `try/catch` blocks, guaranteeing that if a single pincode fails to generate (due to network timeout or data corruption), the job logs the error and gracefully continues processing the remaining thousands of regions without terminating.
+- **Purpose:** Defines the automated background cron scheduler powered by `node-cron`, set to run nightly at 2:00 AM IST.
+- **Architecture:** Executes a resilient "Progressive Pipeline" that sequentially builds catalogs from Pincode up to Country level.
+- **Fault Tolerance:** Enforces intentional delays (`GEO_CRON_PINCODE_DELAY_MS`) to prevent API throttling and wraps execution in granular `try/catch` blocks so failures in single regions do not halt the entire process.
 
 **The Full Code:**
 ```js
@@ -3537,7 +3570,8 @@ module.exports = {
 ### File 15: `backend/catalogue_mgmt_service/src/apis/routes/index.js`
 
 **Why the code is there & What it is doing:**
-This file is the central aggregator for all Express routes within the `catalogue_mgmt_service`. It initializes an Express `Router` and mounts various domain-specific route files under their respective paths. For the newly introduced geo-intelligent feature, this file is modified to import the `v1/geo.js` router and bind it to the application middleware chain, making all geographic endpoints accessible globally under the `http://localhost:2210/cms/apis/v1/geo` base URL.
+- **Purpose:** The central aggregator for all Express routes within the `catalogue_mgmt_service`.
+- **Integration:** Imports the `v1/geo.js` router and mounts it to the global middleware chain, exposing the new geographic endpoints at `http://localhost:2210/cms/apis/v1/geo`.
 
 **The Full Code:**
 ```js
@@ -3578,7 +3612,9 @@ module.exports = router;
 ### File 16: `backend/catalogue_mgmt_service/src/InitApp/index.js`
 
 **Why the code is there & What it is doing:**
-This is the core application bootstrap and initialization module. Upon server start, it orchestrates the fundamental setup: establishing persistent connections to PostgreSQL via Knex, connecting to MongoDB via Mongoose, configuring global Express middleware (like CORS and JSON body parsers), and mounting the master routing index. Furthermore, it explicitly imports the `startGeoCatalogJob` function from `geoCatalog.job.js` and invokes it. This ensures that the nightly 2:00 AM background cron job is officially scheduled and activated the moment the backend microservice spins up in production.
+- **Purpose:** The core application bootstrap and initialization module.
+- **Setup:** Establishes PostgreSQL/MongoDB connections and configures global Express middleware.
+- **Cron Activation:** Explicitly imports and invokes `startGeoCatalogJob()`, guaranteeing the nightly 2:00 AM background job is scheduled the moment the backend spins up.
 
 **The Full Code:**
 ```js
@@ -3992,4 +4028,3 @@ If you still want the test page for manual validation:
 | Cron job | Already running | Skips second invocation (guard flag) |
 | Cron job | Hierarchy rebuild fails | Logs error, pincode data still saved |
 | Controller | Any unhandled error | Returns `500` with JSON error message |
-
