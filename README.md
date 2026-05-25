@@ -1,4 +1,4 @@
-# Geo-Intelligent Auto Catalog System — Full Implementation
+[# Geo-Intelligent Auto Catalog System — Full Implementation
 
 ## Core Design Principle
 
@@ -2321,3 +2321,4 @@ If you still want the test page for manual validation:
 | Cron job | Already running | Skips second invocation (guard flag) |
 | Cron job | Hierarchy rebuild fails | Logs error, pincode data still saved |
 | Controller | Any unhandled error | Returns `500` with JSON error message |
+](https://github.com/jsmith982004/trial/blob/main/README.md)
